@@ -1,7 +1,7 @@
 use bevy_app::App;
 use bevy_ecs::{entity::MapEntities, prelude::*, system::RunSystemOnce};
 use bevy_gigasaver::{
-    AppSaveExt, Capture, Dirty, Error, SavePlugin, WorldSaveExt, component, resource,
+    AppSaveExt, Capture, Dirty, Error, LoadOutcome, SavePlugin, WorldSaveExt, component, resource,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -501,7 +501,10 @@ fn wrong_manifest_and_foreign_databases_are_rejected() {
         .add_plugins(SavePlugin::sqlite(&path))
         .persist(component::<Position>("renamed"));
     assert!(matches!(different.world_mut().load(), Err(Error::Manifest)));
-    assert!(matches!(different.world_mut().save(), Err(Error::Manifest)));
+    assert!(matches!(
+        different.world_mut().save(),
+        Err(Error::LoadRequired)
+    ));
     let foreign = directory.path().join("foreign.sqlite");
     let connection = Connection::open(&foreign).unwrap();
     connection
@@ -520,13 +523,13 @@ fn missing_file_load_does_not_create_it_and_missing_plugin_is_an_error() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("missing.sqlite");
     let mut app = app(&path, Capture::Snapshot);
-    assert!(app.world_mut().load().is_err());
+    assert_eq!(app.world_mut().load().unwrap(), LoadOutcome::Missing);
     assert!(!path.exists());
     assert!(matches!(World::new().save(), Err(Error::MissingPlugin)));
 }
 
 #[test]
-fn first_save_in_a_new_app_replaces_the_old_scope() {
+fn first_save_in_a_new_app_cannot_replace_the_old_scope() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("save.sqlite");
     let mut first = app(&path, Capture::Dirty);
@@ -534,12 +537,73 @@ fn first_save_in_a_new_app_replaces_the_old_scope() {
     first.world_mut().save().unwrap();
     let mut second = app(&path, Capture::Dirty);
     second.world_mut().spawn(Position { name: 2, value: 2 });
-    assert_eq!(second.world_mut().save().unwrap().generation, 2);
+    assert!(matches!(
+        second.world_mut().save(),
+        Err(Error::LoadRequired)
+    ));
     first.world_mut().load().unwrap();
     assert_eq!(
         positions(first.world_mut()),
-        [Position { name: 2, value: 2 }]
+        [Position { name: 1, value: 1 }]
     );
+    second.world_mut().load().unwrap();
+    assert_eq!(second.world_mut().save().unwrap().generation, 2);
+}
+
+#[test]
+fn failed_load_blocks_writes_until_a_successful_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("save.sqlite");
+    let mut writer = app(&path, Capture::Changed);
+    writer.insert_resource(Clock(7));
+    writer.world_mut().save().unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE records SET payload = X'00' WHERE type_key = 'clock'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        writer.world_mut().load(),
+        Err(Error::Decode { .. })
+    ));
+    for _ in 0..3 {
+        assert!(matches!(
+            writer.world_mut().save(),
+            Err(Error::LoadRequired)
+        ));
+    }
+    let generation: i64 = connection
+        .query_row("SELECT generation FROM meta", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, 1);
+    connection
+        .execute(
+            "UPDATE records SET payload = ?1 WHERE type_key = 'clock'",
+            [b"9".to_vec()],
+        )
+        .unwrap();
+    writer.world_mut().load().unwrap();
+    assert_eq!(writer.world().resource::<Clock>().0, 9);
+    assert_eq!(writer.world_mut().save().unwrap().generation, 2);
+}
+
+#[test]
+fn another_writer_creating_a_previously_missing_save_is_a_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("save.sqlite");
+    let mut first = app(&path, Capture::Changed);
+    assert_eq!(first.world_mut().load().unwrap(), LoadOutcome::Missing);
+    let mut second = app(&path, Capture::Changed);
+    second.world_mut().save().unwrap();
+    assert!(matches!(
+        first.world_mut().save(),
+        Err(Error::Conflict {
+            expected: 0,
+            actual: 1
+        })
+    ));
 }
 
 #[test]
@@ -557,4 +621,17 @@ fn corrupt_orphan_record_is_rejected_even_if_foreign_keys_were_disabled() {
         )
         .unwrap();
     assert!(matches!(app.world_mut().load(), Err(Error::InvalidData(_))));
+}
+
+#[test]
+fn empty_files_and_directories_are_failed_loads_not_missing_saves() {
+    let directory = tempfile::tempdir().unwrap();
+    let empty = directory.path().join("empty.sqlite");
+    std::fs::write(&empty, []).unwrap();
+    for path in [&empty, directory.path()] {
+        let mut app = app(path, Capture::Snapshot);
+        assert!(app.world_mut().load().is_err());
+        assert!(matches!(app.world_mut().save(), Err(Error::LoadRequired)));
+    }
+    assert_eq!(std::fs::metadata(empty).unwrap().len(), 0);
 }

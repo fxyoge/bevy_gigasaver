@@ -18,7 +18,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCHES = ("snapshot", "changed", "explicit_dirty", "mixed")
+BENCHES = ("snapshot", "changed", "explicit_dirty", "mixed", "lifecycle")
 
 
 def run(command, *, env=None):
@@ -94,11 +94,16 @@ def main():
                         help="Hard timeout in seconds per suite (default: 180)")
     parser.add_argument("--filter", help="Run only case names matching this Divan pattern")
     parser.add_argument("--bench", choices=BENCHES, action="append",
-                        help="Run selected suites; repeat to select more than one")
+                         help="Run selected suites; repeat to select more than one")
+    parser.add_argument("--frames", action="store_true",
+                        help="Measure 1200 lifecycle frames, separating idle/save percentiles")
     args = parser.parse_args()
     count = args.sample_count if args.sample_count is not None else (5 if args.profile == "quick" else 20)
     if count < 1 or args.timeout <= 0:
         parser.error("sample count and timeout must be positive")
+    if args.frames and (args.filter or args.bench not in (None, ["lifecycle"])):
+        parser.error("--frames only supports the lifecycle suite and no filter")
+    suites = ["lifecycle"] if args.frames else (args.bench or list(BENCHES))
 
     # Build before sampling. Disk suites run serially to avoid self-interference.
     subprocess.run(["cargo", "bench", "--no-run", "--locked"], cwd=ROOT, check=True)
@@ -124,9 +129,14 @@ def main():
         "rustflags": os.environ.get("RUSTFLAGS", ""),
         "profile": args.profile,
         "status": "running",
-        "requested_suites": args.bench or list(BENCHES),
+        "requested_suites": suites,
         "sqlite_policy": "bundled SQLite; WAL; synchronous=FULL; automatic checkpointing",
         "method": (
+            "1200 updates at 20ms real elapsed time per update; autosave every 1s; "
+            "10 component mutations per update. Initial baseline excluded. "
+            "Actual update wall-time percentiles, idle and save frames separated. "
+            "Single local run; uncontrolled host activity and CPU frequency."
+        ) if args.frames else (
             "Warm-cache, steady-baseline fixtures. Setup/baseline/destruction excluded. "
             "Commit includes simulation and synchronous persistence. Sustained samples "
             "contain 120 updates / 12 commits. Divan samples are not frame percentiles. "
@@ -137,10 +147,10 @@ def main():
     }
     with tempfile.TemporaryDirectory(prefix="gigasaver-", dir=args.temp_root) as temporary:
         env = dict(os.environ, TMPDIR=str(Path(temporary).resolve()))
-        for name in args.bench or BENCHES:
-            command = ["cargo", "bench", "--locked", "--bench", name, "--", "--color", "never",
-                       "--sample-count", str(count)]
-            if args.profile == "quick":
+        for name in suites:
+            command = ["cargo", "bench", "--locked", "--bench", name, "--"]
+            command += ["--frames"] if args.frames else ["--color", "never", "--sample-count", str(count)]
+            if args.profile == "quick" and not args.frames:
                 command += ["--max-time", "2"]
                 if not args.filter:
                     command += ["--skip", "sustained"]

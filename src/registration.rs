@@ -197,6 +197,7 @@ pub(crate) struct Registry {
     pub baseline: bool,
     pub started: bool,
     pub generation: Option<u64>,
+    pub rewrite_manifest: bool,
 }
 
 pub(crate) struct Entry {

@@ -1,6 +1,7 @@
 use crate::{
-    entity,
+    LoadOutcome, entity,
     identity::{Identities, Identity},
+    migration::{MigrationData, SavedType, Schema},
     registration::{Batch, Registry},
 };
 use bevy_ecs::{
@@ -16,12 +17,16 @@ use std::{
 };
 
 const APPLICATION_ID: i64 = 0x4749_4741;
-const FORMAT: i64 = 1;
+const FORMAT: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("install SavePlugin before saving or loading")]
     MissingPlugin,
+    #[error("session is not ready to save")]
+    NotReady,
+    #[error("session is closed; open a save path first")]
+    Closed,
     #[error("SQLite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("encoding {key}: {source}")]
@@ -36,8 +41,16 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
-    #[error("database contains no committed save")]
-    NoSave,
+    #[error("load this save successfully before writing")]
+    LoadRequired,
+    #[error("save file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("save schema {saved} is newer than supported schema {supported}")]
+    NewerSchema { saved: u32, supported: u32 },
+    #[error("missing migration from schema {0}")]
+    MissingMigration(u32),
+    #[error("migration from schema {from}: {message}")]
+    Migration { from: u32, message: String },
     #[error("unrecognized database or unsupported save format")]
     Format,
     #[error("persistent type keys/roles do not match this save's manifest")]
@@ -65,6 +78,8 @@ pub(crate) struct Storage {
     // Connection is Send but not Sync. Exclusive world operations use get_mut,
     // so this wrapper supplies Resource's Sync bound without a runtime lock.
     connection: Mutex<Option<Connection>>,
+    blocked: bool,
+    pub closed: bool,
 }
 
 impl Storage {
@@ -72,7 +87,17 @@ impl Storage {
         Self {
             path,
             connection: Mutex::new(None),
+            blocked: false,
+            closed: false,
         }
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.connection
+            .get_mut()
+            .expect("storage mutex poisoned")
+            .take();
     }
 
     fn connection(&mut self, create: bool) -> Result<&mut Connection, Error> {
@@ -98,12 +123,13 @@ impl Storage {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(
                     "PRAGMA application_id = 1195984705;
-                     PRAGMA user_version = 1;
+                     PRAGMA user_version = 2;
                      CREATE TABLE meta (
                          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                         generation INTEGER NOT NULL CHECK(generation >= 0)
+                         generation INTEGER NOT NULL CHECK(generation >= 0),
+                         schema_version INTEGER NOT NULL CHECK(schema_version > 0)
                      ) STRICT;
-                     INSERT INTO meta VALUES (1, 0);
+                     INSERT INTO meta VALUES (1, 0, 1);
                      CREATE TABLE types (
                          key TEXT PRIMARY KEY, kind INTEGER NOT NULL CHECK(kind IN (0, 1))
                      ) STRICT;
@@ -129,7 +155,7 @@ impl Storage {
                 return Err(Error::Format);
             }
             let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if version != FORMAT {
+            if version != 1 && version != FORMAT {
                 return Err(Error::Format);
             }
             connection.busy_timeout(Duration::from_secs(5))?;
@@ -146,26 +172,33 @@ impl Storage {
 }
 
 fn generation(connection: &Connection) -> Result<i64, Error> {
-    Ok(connection.query_row(
+    let generation = connection.query_row(
         "SELECT generation FROM meta WHERE singleton = 1",
         [],
-        |row| row.get(0),
-    )?)
+        |row| row.get::<_, i64>(0),
+    )?;
+    if generation < 0 {
+        return Err(Error::InvalidData("negative save generation".into()));
+    }
+    Ok(generation)
 }
 
-fn manifest(connection: &Connection, registry: &Registry) -> Result<(), Error> {
-    let actual = connection
+fn read_manifest(connection: &Connection) -> Result<BTreeMap<String, i64>, Error> {
+    Ok(connection
         .prepare("SELECT key, kind FROM types")?
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+        .collect::<Result<BTreeMap<_, _>, _>>()?)
+}
+
+fn check_manifest(actual: &BTreeMap<String, i64>, registry: &Registry) -> Result<(), Error> {
     let expected: BTreeMap<_, _> = registry
         .entries
         .iter()
         .map(|entry| (entry.key.to_owned(), entry.kind))
         .collect();
-    if actual != expected {
+    if *actual != expected {
         return Err(Error::Manifest);
     }
     Ok(())
@@ -174,6 +207,12 @@ fn manifest(connection: &Connection, registry: &Registry) -> Result<(), Error> {
 pub(crate) fn save(world: &mut World) -> Result<SaveStats, Error> {
     if !world.contains_resource::<Storage>() {
         return Err(Error::MissingPlugin);
+    }
+    if world.resource::<Storage>().closed {
+        return Err(Error::Closed);
+    }
+    if world.resource::<Storage>().blocked {
+        return Err(Error::LoadRequired);
     }
     world.flush();
     world.resource_scope(|world, mut registry: Mut<Registry>| {
@@ -201,6 +240,7 @@ pub(crate) fn save(world: &mut World) -> Result<SaveStats, Error> {
                 &registry,
                 world.resource::<Identities>(),
                 &batch,
+                world.resource::<Schema>().version,
             )
         })?;
         for entry in &mut registry.entries {
@@ -208,6 +248,7 @@ pub(crate) fn save(world: &mut World) -> Result<SaveStats, Error> {
         }
         registry.baseline = true;
         registry.generation = Some(stats.generation);
+        registry.rewrite_manifest = false;
         world.resource_mut::<Identities>().acknowledge();
         // Direct World mutations after this call must not share the saved tick.
         world.increment_change_tick();
@@ -220,12 +261,15 @@ fn commit(
     registry: &Registry,
     ids: &Identities,
     batch: &Batch,
+    schema_version: u32,
 ) -> Result<SaveStats, Error> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous = generation(&transaction)?;
-    if let Some(expected) = registry.generation
-        && expected != previous as u64
-    {
+    let expected = registry.generation.unwrap_or(0);
+    if expected != previous as u64 {
+        if registry.generation.is_none() {
+            return Err(Error::LoadRequired);
+        }
         return Err(Error::Conflict {
             expected,
             actual: previous as u64,
@@ -234,7 +278,18 @@ fn commit(
     let next = previous
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("generation exhausted".into()))?;
-    if previous == 0 {
+    // Upgrade the storage layout only inside the successful save transaction.
+    let format: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if format == 1 {
+        transaction.execute_batch("ALTER TABLE meta ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version > 0); PRAGMA user_version = 2;")?;
+    }
+    let mut deletions = 0;
+    if registry.rewrite_manifest {
+        deletions += transaction.execute("DELETE FROM records", [])?;
+        transaction.execute("DELETE FROM entities WHERE id != 0", [])?;
+        transaction.execute("DELETE FROM types", [])?;
+    }
+    if previous == 0 || registry.rewrite_manifest {
         for entry in &registry.entries {
             transaction.execute(
                 "INSERT INTO types(key, kind) VALUES (?1, ?2)",
@@ -242,8 +297,7 @@ fn commit(
             )?;
         }
     }
-    manifest(&transaction, registry)?;
-    let mut deletions = 0;
+    check_manifest(&read_manifest(&transaction)?, registry)?;
     if !registry.baseline {
         deletions += transaction.execute("DELETE FROM records", [])?;
         transaction.execute("DELETE FROM entities WHERE id != 0", [])?;
@@ -291,8 +345,8 @@ fn commit(
         }
     }
     transaction.execute(
-        "UPDATE meta SET generation = ?1 WHERE singleton = 1",
-        [next],
+        "UPDATE meta SET generation = ?1, schema_version = ?2 WHERE singleton = 1",
+        params![next, schema_version],
     )?;
     transaction.commit()?;
     Ok(SaveStats {
@@ -308,48 +362,206 @@ fn commit(
     })
 }
 
-pub(crate) fn load(world: &mut World) -> Result<(), Error> {
+pub(crate) fn load(world: &mut World) -> Result<LoadOutcome, Error> {
     if !world.contains_resource::<Storage>() {
         return Err(Error::MissingPlugin);
     }
+    if world.resource::<Storage>().closed {
+        return Err(Error::Closed);
+    }
+    // Also guards against a panic during user deserialization/component hooks.
+    world.resource_mut::<Storage>().blocked = true;
+    let result = load_inner(world);
+    if result.is_ok() {
+        world.resource_mut::<Storage>().blocked = false;
+    }
+    result
+}
+
+pub(crate) fn can_save(world: &World) -> bool {
+    let storage = world.resource::<Storage>();
+    !storage.closed && !storage.blocked && world.resource::<Registry>().generation.is_some()
+}
+
+pub(crate) fn clear_scope(world: &mut World) {
+    world.flush();
+    world.resource_scope(|world, mut registry: Mut<Registry>| {
+        for entry in &mut registry.entries {
+            entry.codec.reconcile(world);
+        }
+        let entities: Vec<_> = world
+            .resource::<Identities>()
+            .entries
+            .iter()
+            .filter(|(_, id)| id.memberships > 0)
+            .map(|(entity, _)| *entity)
+            .collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+        for entry in &registry.entries {
+            entry
+                .codec
+                .decode(Vec::new())
+                .expect("empty persistence scope decodes")
+                .apply(world, &HashMap::new(), &mut EntityHashMap::default());
+        }
+        world.insert_resource(Identities::default());
+        for entry in &mut registry.entries {
+            entry.codec.reset(world);
+        }
+        registry.baseline = false;
+        registry.rewrite_manifest = false;
+    });
+}
+
+fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
     world.flush();
     world.resource_scope(|world, mut registry: Mut<Registry>| {
         registry.started = true;
-        let (saved_generation, saved_ids, mut records) =
-            world.resource_scope(|_, mut storage: Mut<Storage>| {
-                let transaction = storage.connection(false)?.transaction()?;
-                let saved_generation = generation(&transaction)?;
-                if saved_generation == 0 {
-                    return Err(Error::NoSave);
+        let saved = world.resource_scope(|_, mut storage: Mut<Storage>| {
+            if storage
+                .connection
+                .get_mut()
+                .expect("storage mutex poisoned")
+                .is_none()
+            {
+                match std::fs::metadata(&storage.path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(Error::Io(error)),
+                    Ok(_) => {}
                 }
-                manifest(&transaction, &registry)?;
-                let ids = transaction
-                    .prepare("SELECT id FROM entities WHERE id != 0 ORDER BY id")?
-                    .query_map([], |row| row.get::<_, i64>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut records: HashMap<String, Vec<(i64, Vec<u8>)>> = HashMap::new();
-                {
-                    let mut statement =
-                        transaction.prepare("SELECT entity, type_key, payload FROM records")?;
-                    for row in statement.query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    })? {
-                        let (id, key, payload) = row?;
-                        if id != 0 && ids.binary_search(&id).is_err() {
+            }
+            let transaction = storage.connection(false)?.transaction()?;
+            let saved_generation = generation(&transaction)?;
+            if saved_generation == 0 {
+                return Ok(None);
+            }
+            let manifest = read_manifest(&transaction)?;
+            let format: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            let version = if format == 1 {
+                1
+            } else {
+                transaction.query_row(
+                    "SELECT schema_version FROM meta WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )?
+            };
+            if version == 0 {
+                return Err(Error::InvalidData("zero schema version".into()));
+            }
+            let ids = transaction
+                .prepare("SELECT id FROM entities WHERE id != 0 ORDER BY id")?
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut records: HashMap<String, Vec<(i64, Vec<u8>)>> = HashMap::new();
+            {
+                let mut statement =
+                    transaction.prepare("SELECT entity, type_key, payload FROM records")?;
+                for row in statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })? {
+                    let (id, key, payload) = row?;
+                    if id != 0 && ids.binary_search(&id).is_err() {
+                        return Err(Error::InvalidData(
+                            "record references a missing entity".into(),
+                        ));
+                    }
+                    records.entry(key).or_default().push((id, payload));
+                }
+            }
+            transaction.commit()?;
+            Ok::<_, Error>(Some((saved_generation, ids, records, manifest, version)))
+        })?;
+        let Some((saved_generation, mut saved_ids, mut records, mut manifest, version)) = saved
+        else {
+            registry.baseline = false;
+            registry.generation = Some(0);
+            registry.rewrite_manifest = false;
+            return Ok(LoadOutcome::Missing);
+        };
+        let schema = world.resource::<Schema>();
+        if version > schema.version {
+            return Err(Error::NewerSchema {
+                saved: version,
+                supported: schema.version,
+            });
+        }
+        if version < schema.version {
+            let mut data = MigrationData::new();
+            for (key, kind) in &manifest {
+                let rows = records.remove(key).unwrap_or_default();
+                let mut values = BTreeMap::new();
+                for (id, bytes) in rows {
+                    if (*kind == 0 && id != 0) || (*kind == 1 && id <= 0) {
+                        return Err(Error::InvalidData("record role mismatch".into()));
+                    }
+                    let value = serde_json::from_slice(&bytes).map_err(|error| {
+                        Error::InvalidData(format!("decoding migration input {key}: {error}"))
+                    })?;
+                    values.insert(id, value);
+                }
+                let value = match kind {
+                    0 => SavedType::Resource(values.remove(&0)),
+                    1 => SavedType::Component(values),
+                    _ => return Err(Error::InvalidData("unknown persistence role".into())),
+                };
+                data.insert(key.clone(), value);
+            }
+            if !records.is_empty() {
+                return Err(Error::InvalidData("unknown record type".into()));
+            }
+            schema.migrate(version, &mut data)?;
+            manifest.clear();
+            for (key, value) in data {
+                let (kind, values) = match value {
+                    SavedType::Resource(value) => (
+                        0,
+                        value
+                            .map(|value| (0, value))
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                    ),
+                    SavedType::Component(values) => {
+                        if values
+                            .keys()
+                            .any(|id| *id <= 0 || saved_ids.binary_search(id).is_err())
+                        {
                             return Err(Error::InvalidData(
-                                "record references a missing entity".into(),
+                                "migration introduced an unknown component identity".into(),
                             ));
                         }
-                        records.entry(key).or_default().push((id, payload));
+                        (1, values.into_iter().collect())
                     }
-                }
-                transaction.commit()?;
-                Ok::<_, Error>((saved_generation, ids, records))
-            })?;
+                };
+                manifest.insert(key.clone(), kind);
+                records.insert(
+                    key,
+                    values
+                        .into_iter()
+                        .map(|(id, value)| {
+                            serde_json::to_vec(&value)
+                                .map(|bytes| (id, bytes))
+                                .map_err(|error| Error::InvalidData(error.to_string()))
+                        })
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+            // Removing a type must not leave invisible empty entities keeping
+            // references alive. Decoding below rejects references to those IDs.
+            let retained: std::collections::HashSet<_> = records
+                .values()
+                .flatten()
+                .filter_map(|(id, _)| (*id > 0).then_some(*id))
+                .collect();
+            saved_ids.retain(|id| retained.contains(id));
+        }
+        check_manifest(&manifest, &registry)?;
         let placeholders: HashMap<_, _> = saved_ids
             .iter()
             .enumerate()
@@ -425,7 +637,8 @@ pub(crate) fn load(world: &mut World) -> Result<(), Error> {
         }
         registry.baseline = false;
         registry.generation = Some(saved_generation as u64);
+        registry.rewrite_manifest = version != world.resource::<Schema>().version;
         world.increment_change_tick();
-        Ok(())
+        Ok(LoadOutcome::Loaded)
     })
 }

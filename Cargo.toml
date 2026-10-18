@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 bevy_app = { version = "0.20.0", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }
+bevy_time = { version = "0.20.0", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +33,10 @@ harness = false
 
 [[bench]]
 name = "mixed"
+harness = false
+
+[[bench]]
+name = "lifecycle"
 harness = false
 
 [lints.rust]
