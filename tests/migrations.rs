@@ -1,8 +1,6 @@
 use bevy_app::App;
 use bevy_ecs::prelude::*;
-use bevy_gigasaver::{
-    AppSaveExt, Capture, Error, SavePlugin, SavedType, WorldSaveExt, component, resource,
-};
+use bevy_gigasaver::{AppSaveExt, Capture, Error, SavePlugin, SavedType, WorldSaveExt, component};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,19 +28,19 @@ struct Node {
     target: Entity,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 struct Settings {
     enabled: bool,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 struct Obsolete(u64);
 
 fn old(path: &Path) -> App {
     let mut app = App::new();
     app.add_plugins(SavePlugin::sqlite(path))
         .persist(component::<OldNode>("old_node"))
-        .persist(resource::<Obsolete>("obsolete"))
+        .persist_resource::<Obsolete>("obsolete")
         .insert_resource(Obsolete(99));
     app
 }
@@ -98,7 +96,7 @@ fn current(path: &Path, calls: Arc<AtomicUsize>) -> App {
             }),
     )
     .persist(component::<Node>("node").capture(Capture::Changed))
-    .persist(resource::<Settings>("settings"));
+    .persist_resource::<Settings>("settings");
     app
 }
 
@@ -197,7 +195,7 @@ fn missing_and_failing_steps_preserve_live_state_and_committed_data() {
         }
         let mut app = App::new();
         app.add_plugins(plugin)
-            .persist(resource::<Settings>("settings"))
+            .persist_resource::<Settings>("settings")
             .insert_resource(Settings { enabled: false });
         let error = app.world_mut().load().unwrap_err();
         assert!(matches!(
@@ -234,7 +232,7 @@ fn invalid_migrated_payload_and_dangling_references_fail_before_replacement() {
                 }),
         )
         .persist(component::<OldNode>("old_node"))
-        .persist(resource::<Obsolete>("obsolete"));
+        .persist_resource::<Obsolete>("obsolete");
         let live = app.world_mut().spawn_empty().id();
         app.world_mut().entity_mut(live).insert(OldNode {
             amount: 42,
@@ -335,7 +333,7 @@ fn removing_a_referenced_entity_during_migration_does_not_leave_a_phantom_target
         Ok(())
     }))
     .persist(component::<OldNode>("old_node"))
-    .persist(resource::<Obsolete>("obsolete"));
+    .persist_resource::<Obsolete>("obsolete");
     assert!(matches!(app.world_mut().load(), Err(Error::Decode { .. })));
     assert!(matches!(app.world_mut().save(), Err(Error::LoadRequired)));
     assert_old_readable(&path);

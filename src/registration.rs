@@ -2,14 +2,19 @@ use crate::{Error, entity, identity::Identities};
 use bevy_app::App;
 use bevy_ecs::{
     change_detection::{DetectChanges, MAX_CHANGE_AGE, Tick},
-    entity::{EntityHashMap, MapEntities},
+    entity::EntityHashMap,
     entity_disabling::DefaultQueryFilters,
     prelude::*,
     query::{ArchetypeFilter, QueryState},
     system::SystemParam,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{any::TypeId, collections::HashSet, marker::PhantomData, sync::Mutex};
+use std::{
+    any::{Any, TypeId},
+    collections::HashSet,
+    marker::PhantomData,
+    sync::Mutex,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Capture {
@@ -24,6 +29,7 @@ pub enum Capture {
 pub struct ComponentSave<T, F = ()> {
     key: &'static str,
     capture: Capture,
+    attached: bool,
     marker: PhantomData<fn() -> (T, F)>,
 }
 
@@ -33,11 +39,17 @@ pub fn component<T: Component + Serialize + DeserializeOwned>(
     ComponentSave {
         key,
         capture: Capture::Snapshot,
+        attached: false,
         marker: PhantomData,
     }
 }
 
 impl<T, F> ComponentSave<T, F> {
+    /// Save this component only on entities selected by other registrations.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
     pub fn capture(mut self, capture: Capture) -> Self {
         self.capture = capture;
         self
@@ -49,27 +61,27 @@ impl<T, F> ComponentSave<T, F> {
         ComponentSave {
             key: self.key,
             capture: self.capture,
+            attached: self.attached,
             marker: PhantomData,
         }
     }
 }
 
-type Remap<T> = fn(&mut T, &mut EntityHashMap<Entity>);
-
-pub struct ResourceSave<T> {
+struct ResourceSave<T> {
     key: &'static str,
-    remap: Option<Remap<T>>,
+    initialize: fn(&mut World),
+    marker: PhantomData<T>,
 }
 
-pub fn resource<T: Resource + Serialize + DeserializeOwned>(key: &'static str) -> ResourceSave<T> {
-    ResourceSave { key, remap: None }
-}
-
-impl<T: MapEntities> ResourceSave<T> {
-    /// Required for resource fields using the entity Serde adapter.
-    pub fn map_entities(mut self) -> Self {
-        self.remap = Some(T::map_entities);
-        self
+fn resource<T: Resource + FromWorld + Serialize + DeserializeOwned>(
+    key: &'static str,
+) -> ResourceSave<T> {
+    ResourceSave {
+        key,
+        initialize: |world| {
+            world.init_resource::<T>();
+        },
+        marker: PhantomData,
     }
 }
 
@@ -77,17 +89,58 @@ pub struct Registration {
     key: &'static str,
     kind: i64,
     type_id: TypeId,
-    setup: Setup,
+    pub(crate) setup: Setup,
 }
 
-type Setup = Box<dyn FnOnce(&mut World) -> Box<dyn Codec> + Send + Sync>;
+impl Registration {
+    pub(crate) fn new_adapter(key: &'static str, type_id: TypeId, setup: Setup) -> Self {
+        Self {
+            key,
+            kind: 0,
+            type_id,
+            setup,
+        }
+    }
+}
+
+pub(crate) type Setup = Box<dyn FnOnce(&mut World) -> Box<dyn Codec> + Send + Sync>;
 
 pub trait AppSaveExt {
     /// Keys are on-disk schema identifiers. Registration freezes at first save/load.
     fn persist(&mut self, registration: impl Into<Registration>) -> &mut Self;
+    fn persist_resource<T: Resource + FromWorld + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self;
+    fn persist_component<T: Component + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self;
+    fn persist_attached_component<T: Component + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self;
 }
 
 impl AppSaveExt for App {
+    fn persist_resource<T: Resource + FromWorld + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self {
+        self.persist(resource::<T>(intern_key(key)))
+    }
+    fn persist_component<T: Component + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self {
+        self.persist(component::<T>(intern_key(key)))
+    }
+    fn persist_attached_component<T: Component + Serialize + DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> &mut Self {
+        self.persist(component::<T>(intern_key(key)).attached())
+    }
     fn persist(&mut self, registration: impl Into<Registration>) -> &mut Self {
         let registration = registration.into();
         self.init_resource::<Registry>()
@@ -127,6 +180,10 @@ impl AppSaveExt for App {
                 type_id: registration.type_id,
                 codec,
             });
+        self.world_mut()
+            .resource_mut::<Registry>()
+            .entries
+            .sort_by_key(|entry| entry.codec.priority());
         self
     }
 }
@@ -221,9 +278,23 @@ pub(crate) struct Batch {
 }
 
 pub(crate) trait Codec: Send + Sync {
+    fn priority(&self) -> u8 {
+        1
+    }
+    fn initialize(&self, _world: &mut World) {}
+    fn clear(&self, _world: &mut World) {}
     fn reconcile(&mut self, world: &mut World);
-    fn capture(&mut self, world: &World, baseline: bool, batch: &mut Batch) -> Result<(), Error>;
-    fn decode(&self, records: Vec<(i64, Vec<u8>)>) -> Result<Box<dyn Decoded>, Error>;
+    fn capture(
+        &mut self,
+        world: &mut World,
+        baseline: bool,
+        batch: &mut Batch,
+    ) -> Result<Option<Box<dyn Any>>, Error>;
+    fn decode(
+        &self,
+        world: &mut World,
+        records: Vec<(i64, Vec<u8>)>,
+    ) -> Result<Box<dyn Decoded>, Error>;
     fn acknowledge(&mut self, world: &mut World, tick: Tick);
     fn reset(&mut self, world: &mut World);
 }
@@ -242,6 +313,7 @@ struct ComponentCodec<T: Component, F: ArchetypeFilter + 'static> {
     capture: Capture,
     query: QueryState<(Entity, Ref<'static, T>), F>,
     last_commit: Tick,
+    attached: bool,
 }
 
 impl<T, F> From<ComponentSave<T, F>> for Registration
@@ -258,7 +330,7 @@ where
                 world.insert_resource(Tracking::<T> {
                     members: HashSet::new(),
                     pending: Mutex::default(),
-                    filtered: TypeId::of::<F>() != TypeId::of::<()>(),
+                    filtered: value.attached || TypeId::of::<F>() != TypeId::of::<()>(),
                     marker: PhantomData,
                 });
                 world.add_observer(inserted::<T>);
@@ -274,6 +346,7 @@ where
                         world.query_filtered()
                     },
                     last_commit: Tick::new(0),
+                    attached: value.attached,
                 };
                 codec.reset(world);
                 Box::new(codec)
@@ -288,6 +361,9 @@ where
     F: ArchetypeFilter + 'static,
 {
     fn refresh_membership(&mut self, world: &mut World) {
+        if self.attached {
+            return;
+        }
         self.query.update_archetypes(world);
         let ordered: Vec<_> = self.query.iter(world).map(|(entity, _)| entity).collect();
         let selected: HashSet<_> = ordered.iter().copied().collect();
@@ -353,7 +429,36 @@ where
         }
     }
 
-    fn capture(&mut self, world: &World, baseline: bool, batch: &mut Batch) -> Result<(), Error> {
+    fn capture(
+        &mut self,
+        world: &mut World,
+        baseline: bool,
+        batch: &mut Batch,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        if self.attached {
+            for (entity, value) in self.query.iter_manual(world) {
+                if world
+                    .resource::<Identities>()
+                    .entries
+                    .get(&entity)
+                    .is_some_and(|id| id.memberships > 0)
+                {
+                    self.encode(entity, &value, world, batch)?;
+                }
+            }
+            let tracking = world.resource::<Tracking<T>>();
+            let pending = tracking.pending.lock().expect("dirty queue poisoned");
+            let ids = world.resource::<Identities>();
+            for entity in pending
+                .iter()
+                .filter(|entity| world.get::<T>(**entity).is_none())
+            {
+                if let Some(identity) = ids.entries.get(entity) {
+                    batch.deletes.push((identity.id, self.key));
+                }
+            }
+            return Ok(None);
+        }
         let tracking = world.resource::<Tracking<T>>();
         let pending = tracking.pending.lock().expect("dirty queue poisoned");
         let expired = world
@@ -393,10 +498,14 @@ where
                 batch.deletes.push((identity.id, self.key));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn decode(&self, records: Vec<(i64, Vec<u8>)>) -> Result<Box<dyn Decoded>, Error> {
+    fn decode(
+        &self,
+        _world: &mut World,
+        records: Vec<(i64, Vec<u8>)>,
+    ) -> Result<Box<dyn Decoded>, Error> {
         let values = records
             .into_iter()
             .map(|(id, payload)| {
@@ -454,8 +563,9 @@ impl<T: Component> Decoded for DecodedComponent<T> {
 
 struct ResourceCodec<T> {
     key: &'static str,
-    remap: Option<Remap<T>>,
     present: bool,
+    initialize: fn(&mut World),
+    marker: PhantomData<T>,
 }
 
 impl<T: Resource + Serialize + DeserializeOwned> From<ResourceSave<T>> for Registration {
@@ -467,8 +577,9 @@ impl<T: Resource + Serialize + DeserializeOwned> From<ResourceSave<T>> for Regis
             setup: Box::new(move |_| {
                 Box::new(ResourceCodec::<T> {
                     key: value.key,
-                    remap: value.remap,
                     present: false,
+                    initialize: value.initialize,
+                    marker: PhantomData,
                 })
             }),
         }
@@ -476,9 +587,20 @@ impl<T: Resource + Serialize + DeserializeOwned> From<ResourceSave<T>> for Regis
 }
 
 impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
+    fn initialize(&self, world: &mut World) {
+        (self.initialize)(world);
+    }
+    fn clear(&self, world: &mut World) {
+        world.remove_resource::<T>();
+    }
     fn reconcile(&mut self, _: &mut World) {}
 
-    fn capture(&mut self, world: &World, baseline: bool, batch: &mut Batch) -> Result<(), Error> {
+    fn capture(
+        &mut self,
+        world: &mut World,
+        baseline: bool,
+        batch: &mut Batch,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
         if let Some(value) = world.get_resource::<T>() {
             let encode = || {
                 serde_json::to_vec(value).map_err(|source| Error::Encode {
@@ -486,13 +608,7 @@ impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
                     source,
                 })
             };
-            let (payload, references) = entity::references(|| {
-                if self.remap.is_some() {
-                    encode()
-                } else {
-                    entity::forbidden(encode)
-                }
-            });
+            let (payload, references) = entity::references(encode);
             batch.upserts.push(Record {
                 id: 0,
                 key: self.key,
@@ -502,10 +618,14 @@ impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
         } else if baseline && self.present {
             batch.deletes.push((0, self.key));
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn decode(&self, records: Vec<(i64, Vec<u8>)>) -> Result<Box<dyn Decoded>, Error> {
+    fn decode(
+        &self,
+        _world: &mut World,
+        records: Vec<(i64, Vec<u8>)>,
+    ) -> Result<Box<dyn Decoded>, Error> {
         if records.len() > 1 || records.first().is_some_and(|(id, _)| *id != 0) {
             return Err(Error::InvalidData("resource stored as components".into()));
         }
@@ -519,17 +639,10 @@ impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
                         source,
                     })
                 };
-                if self.remap.is_some() {
-                    decode()
-                } else {
-                    entity::forbidden(decode)
-                }
+                decode()
             })
             .transpose()?;
-        Ok(Box::new(DecodedResource::<T> {
-            value,
-            remap: self.remap,
-        }))
+        Ok(Box::new(DecodedResource::<T> { value }))
     }
 
     fn acknowledge(&mut self, world: &mut World, _: Tick) {
@@ -540,9 +653,51 @@ impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
     }
 }
 
+pub(crate) fn intern_key(key: &str) -> &'static str {
+    use std::sync::OnceLock;
+    static KEYS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut keys = KEYS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("save key interner poisoned");
+    if let Some(key) = keys.get(key) {
+        return key;
+    }
+    let key = Box::leak(key.to_owned().into_boxed_str());
+    keys.insert(key);
+    key
+}
+
+#[doc(hidden)]
+pub struct Declaration {
+    pub key: &'static str,
+    pub install: fn(&mut App),
+}
+inventory::collect!(Declaration);
+
+#[doc(hidden)]
+pub fn declare_resource<T: Resource + FromWorld + Serialize + DeserializeOwned>(
+    app: &mut App,
+    key: &str,
+) {
+    app.persist_resource::<T>(key);
+}
+
+#[doc(hidden)]
+pub fn declare_component<T: Component + Serialize + DeserializeOwned>(app: &mut App, key: &str) {
+    app.persist_component::<T>(key);
+}
+
+pub(crate) fn initialize(world: &mut World) {
+    world.resource_scope(|world, registry: Mut<Registry>| {
+        for entry in &registry.entries {
+            entry.codec.initialize(world);
+        }
+    });
+}
+
 struct DecodedResource<T> {
     value: Option<T>,
-    remap: Option<Remap<T>>,
 }
 
 impl<T: Resource> Decoded for DecodedResource<T> {
@@ -550,12 +705,9 @@ impl<T: Resource> Decoded for DecodedResource<T> {
         self: Box<Self>,
         world: &mut World,
         _: &std::collections::HashMap<i64, Entity>,
-        mapper: &mut EntityHashMap<Entity>,
+        _: &mut EntityHashMap<Entity>,
     ) {
-        if let Some(mut value) = self.value {
-            if let Some(remap) = self.remap {
-                remap(&mut value, mapper);
-            }
+        if let Some(value) = self.value {
             world.insert_resource(value);
         } else {
             world.remove_resource::<T>();

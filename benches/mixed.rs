@@ -1,6 +1,6 @@
 use bevy_app::{App, Update};
 use bevy_ecs::prelude::*;
-use bevy_gigasaver::{AppSaveExt, Capture, Dirty, SavePlugin, WorldSaveExt, component, resource};
+use bevy_gigasaver::{AppSaveExt, Capture, Dirty, SavePlugin, WorldSaveExt, component};
 use divan::{Bencher, black_box};
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +17,7 @@ struct Machine {
     owner: Entity,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 struct Research {
     tick: u64,
 }
@@ -43,7 +43,7 @@ fn commit(bencher: Bencher, entities: usize) {
             app.add_plugins(SavePlugin::sqlite(directory.path().join("save.sqlite")))
                 .persist(component::<Player>("player"))
                 .persist(component::<Machine>("machine").capture(Capture::Dirty))
-                .persist(resource::<Research>("research"))
+                .persist_resource::<Research>("research")
                 .insert_resource(Research { tick: 0 })
                 .add_systems(Update, simulate);
             let owner = app.world_mut().spawn(Player { health: 100 }).id();

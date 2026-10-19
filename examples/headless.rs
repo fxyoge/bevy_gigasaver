@@ -4,8 +4,7 @@
 use bevy_app::{App, AppExit, Update};
 use bevy_ecs::prelude::*;
 use bevy_gigasaver::{
-    AppSaveExt, Capture, LoadOutcome, SaveLoaded, SavePlugin, SaveStatus, SavedType, component,
-    resource,
+    AppSaveExt, Capture, LoadOutcome, SaveOpened, SavePlugin, SaveStatus, SavedType, component,
 };
 use bevy_time::TimePlugin;
 use serde::{Deserialize, Serialize};
@@ -19,12 +18,12 @@ struct Node {
     peer: Entity,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 struct Account {
     credits: u64,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Default, Serialize, Deserialize)]
 struct LegacyAccount {
     balance: u64,
 }
@@ -62,9 +61,9 @@ fn main() {
     let plugin = SavePlugin::sqlite(&path).autosave(Duration::from_millis(250));
     if legacy {
         app.add_plugins(plugin)
-            .persist(resource::<LegacyAccount>("account"))
+            .persist_resource::<LegacyAccount>("account")
             .add_systems(
-                SaveLoaded,
+                SaveOpened,
                 (|mut commands: Commands| {
                     commands.insert_resource(LegacyAccount { balance: 10 });
                 })
@@ -80,9 +79,9 @@ fn main() {
             account.insert("credits".into(), balance);
             Ok(())
         }))
-        .persist(resource::<Account>("account"))
+        .persist_resource::<Account>("account")
         .add_systems(
-            SaveLoaded,
+            SaveOpened,
             (|mut commands: Commands| {
                 commands.insert_resource(Account { credits: 10 });
             })
@@ -90,12 +89,12 @@ fn main() {
         );
     }
     app.persist(component::<Node>("node").capture(Capture::Changed))
-        .add_systems(SaveLoaded, initialize.run_if(fresh))
+        .add_systems(SaveOpened, initialize.run_if(fresh))
         .add_systems(Update, simulate);
     app.world_mut().spawn(Transient);
     app.update();
     let status = app.world().resource::<SaveStatus>();
-    println!("{}: {:?}", status.path().display(), status.load());
+    println!("{:?}: {:?}", status.path(), status.load());
     if !status.can_save() {
         std::process::exit(1);
     }

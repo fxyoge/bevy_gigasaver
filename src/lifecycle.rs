@@ -1,4 +1,8 @@
-use crate::{Error, LoadOutcome, SaveStats, WorldSaveExt, registration::Registry, storage};
+use crate::{
+    Error, LoadOutcome, SaveStats,
+    registration::{self, Registry},
+    storage::{self, Storage},
+};
 use bevy_app::{App, AppExit, Last, PreStartup};
 use bevy_ecs::{
     prelude::*,
@@ -6,62 +10,61 @@ use bevy_ecs::{
 };
 use bevy_time::{Real, Time};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-/// Ordering boundaries: initial load in `PreStartup`, requests/autosaves in `Last`.
-/// Put teardown after `SaveSet::Save` so final saves precede entity removal.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SaveSet {
     Load,
     Save,
+    /// Reestablish derived gameplay invariants after resources and entities exist.
+    Rebuild,
+    /// Session-facing systems run after reconstruction and deferred commands.
+    Ready,
 }
 
-/// Runs after every successful load, including a missing destination on open.
-/// Configure existing fresh-session initialization here, conditioned on
-/// `SaveStatus::load() == Some(&Ok(LoadOutcome::Missing))`.
-/// This also runs for direct `World::load()` calls; configure before loading.
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SaveLoaded;
-
+pub struct PrepareSave;
+#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SaveOpened;
+#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SaveClosed;
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckReadiness;
 
-/// Requests are processed in order in `Last`, at `SaveSet::Save`.
+#[derive(Resource, Default, Clone, PartialEq, Eq)]
+pub struct SaveSettings {
+    /// None means Never. Explicit requests and the final exit save still work.
+    pub interval: Option<Duration>,
+}
+
 #[derive(Message, Clone, Debug)]
 pub enum SaveRequest {
     Save,
     Load,
-    /// Saves the outgoing session before opening another path. Failure to save
-    /// retains the outgoing session. Destination decode failures preserve live
-    /// state but block writes to the destination until a successful load.
     Open(PathBuf),
-    /// Saves, then removes selected entities/resources and disables persistence.
     Close,
 }
 
-/// Observational results. Error strings retain the operation's diagnostic;
-/// direct World methods also return the structured `Error`.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct SaveStatus {
-    path: PathBuf,
+    path: Option<PathBuf>,
     load: Option<Result<LoadOutcome, String>>,
     last_save: Option<Result<SaveStats, String>>,
+    loading: bool,
     writable: bool,
 }
-
 impl SaveStatus {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
-            load: None,
-            last_save: None,
-            writable: false,
+            ..Default::default()
         }
     }
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
     pub fn load(&self) -> Option<&Result<LoadOutcome, String>> {
         self.load.as_ref()
@@ -69,194 +72,312 @@ impl SaveStatus {
     pub fn last_save(&self) -> Option<&Result<SaveStats, String>> {
         self.last_save.as_ref()
     }
-    /// Safety authorization, independent of the configured application readiness condition.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
     pub fn can_save(&self) -> bool {
         self.writable
     }
 }
 
+struct Opening {
+    path: PathBuf,
+    storage: Storage,
+}
 #[derive(Resource)]
-pub(crate) struct Automation {
-    pub enabled: bool,
-    interval: Option<Duration>,
+pub(crate) struct GigasaverSession {
+    opening: Option<Opening>,
+    requests: VecDeque<SaveRequest>,
+    prepared: Option<SaveRequest>,
+    exit: Option<AppExit>,
+    exit_released: bool,
     deadline: Duration,
-    pending: Vec<SaveRequest>,
-    exiting: bool,
-    due: bool,
+    interval: Option<Duration>,
+    enabled: bool,
 }
 
 pub(crate) fn install(app: &mut App, load_on_start: bool, interval: Option<Duration>) {
-    if interval.is_some() {
-        assert!(
-            app.world().contains_resource::<Time<Real>>(),
-            "autosave requires TimePlugin before SavePlugin"
-        );
-    }
-    app.init_schedule(SaveLoaded)
+    assert!(
+        interval.is_none() || app.world().contains_resource::<Time<Real>>(),
+        "autosave requires TimePlugin before SavePlugin"
+    );
+    app.init_schedule(PrepareSave)
+        .init_schedule(SaveOpened)
+        .init_schedule(SaveClosed)
         .init_schedule(CheckReadiness)
+        .configure_sets(SaveOpened, (SaveSet::Rebuild, SaveSet::Ready).chain())
+        .configure_sets(SaveClosed, (SaveSet::Rebuild, SaveSet::Ready).chain())
         .add_message::<SaveRequest>()
-        .insert_resource(Automation {
+        .init_resource::<SaveSettings>()
+        .insert_resource(GigasaverSession {
+            opening: None,
+            requests: VecDeque::new(),
+            prepared: None,
+            exit: None,
+            exit_released: false,
+            deadline: Duration::MAX,
+            interval: None,
             enabled: true,
-            interval,
-            deadline: interval.unwrap_or(Duration::MAX),
-            pending: Vec::new(),
-            exiting: false,
-            due: false,
         })
+        .add_systems(PreStartup, registration::initialize.before(SaveSet::Load))
         .add_systems(
             Last,
-            (prepare, process.run_if(has_work))
+            (collect, process.run_if(has_work))
                 .chain()
                 .in_set(SaveSet::Save),
         );
+    if interval.is_some() {
+        app.insert_resource(SaveSettings { interval });
+    }
     if load_on_start {
         app.add_systems(PreStartup, initial_load.in_set(SaveSet::Load));
     }
 }
 
 fn initial_load(world: &mut World) {
-    // Explicit World calls before the first update already established the session.
-    if !world.resource::<Registry>().started {
-        let _ = world.load();
+    if !world.resource::<Registry>().started
+        && let Some(path) = world.resource::<SaveStatus>().path.clone()
+    {
+        begin_open(world, path);
+        finish_open(world);
     }
 }
-
-pub(crate) fn set_enabled(In(enabled): In<bool>, mut automation: ResMut<Automation>) {
-    if automation.enabled != enabled {
-        automation.enabled = enabled;
-    }
+pub(crate) fn set_enabled(In(enabled): In<bool>, mut session: ResMut<GigasaverSession>) {
+    session.enabled = enabled;
 }
-
-fn prepare(
+fn ready(world: &mut World) -> bool {
+    world.run_schedule(CheckReadiness);
+    world.resource::<GigasaverSession>().enabled
+}
+fn reset_deadline(world: &mut World) {
+    let now = world
+        .get_resource::<Time<Real>>()
+        .map_or(Duration::ZERO, |time| time.elapsed());
+    let mut session = world.resource_mut::<GigasaverSession>();
+    session.deadline = session
+        .interval
+        .map_or(Duration::MAX, |interval| now.saturating_add(interval));
+}
+fn collect(
     mut requests: MessageReader<SaveRequest>,
-    mut exits: MessageReader<AppExit>,
+    mut session: ResMut<GigasaverSession>,
+    settings: Res<SaveSettings>,
     time: Option<Res<Time<Real>>>,
-    mut automation: ResMut<Automation>,
+    status: Res<SaveStatus>,
+    mut exits: ResMut<Messages<AppExit>>,
 ) {
-    let automation = &mut *automation;
-    automation.pending.extend(requests.read().cloned());
-    automation.exiting = exits.read().count() > 0;
     let now = time.as_ref().map_or(Duration::ZERO, |time| time.elapsed());
-    automation.due = automation.interval.is_some() && now >= automation.deadline;
-    if automation.due {
-        automation.deadline = now.saturating_add(automation.interval.unwrap());
+    assert!(
+        settings.interval.is_none() || time.is_some(),
+        "autosave requires TimePlugin"
+    );
+    if session.interval != settings.interval {
+        assert!(
+            !settings.interval.is_some_and(|interval| interval.is_zero()),
+            "autosave interval must be positive"
+        );
+        session.interval = settings.interval;
+        session.deadline = settings
+            .interval
+            .map_or(Duration::MAX, |interval| now.saturating_add(interval));
+    }
+    session.requests.extend(requests.read().cloned());
+    if status.writable && session.exit.is_none() && !session.exit_released && !exits.is_empty() {
+        session.exit = exits.drain().max_by_key(|exit| u8::from(exit.is_error()));
+        if !session
+            .requests
+            .iter()
+            .any(|request| matches!(request, SaveRequest::Save))
+        {
+            session.requests.push_back(SaveRequest::Save);
+        }
     }
 }
-
-fn has_work(automation: Res<Automation>) -> bool {
-    !automation.pending.is_empty() || automation.exiting || automation.due
+fn has_work(
+    session: Res<GigasaverSession>,
+    status: Res<SaveStatus>,
+    time: Option<Res<Time<Real>>>,
+) -> bool {
+    let now = time.as_ref().map_or(Duration::ZERO, |time| time.elapsed());
+    session.opening.is_some()
+        || session.prepared.is_some()
+        || !session.requests.is_empty()
+        || (status.writable && now >= session.deadline)
 }
-
-fn process(world: &mut World) {
-    let (pending, exiting, due) = {
-        let mut automation = world.resource_mut::<Automation>();
-        (
-            std::mem::take(&mut automation.pending),
-            automation.exiting,
-            automation.due,
-        )
+fn save(world: &mut World) -> Result<(), Error> {
+    let result = if ready(world) {
+        storage::save(world)
+    } else {
+        Err(Error::NotReady)
     };
-    let mut saved_current = None;
-    let suppress_autosave = !pending.is_empty();
-    for request in pending {
+    record_save(world, &result);
+    if result.is_ok()
+        && let Some(exit) = world.resource_mut::<GigasaverSession>().exit.take()
+    {
+        world.resource_mut::<GigasaverSession>().exit_released = true;
+        world.write_message(exit);
+    }
+    result.map(|_| ())
+}
+fn begin_open(world: &mut World, path: PathBuf) {
+    world.resource_mut::<GigasaverSession>().opening = Some(Opening {
+        storage: Storage::new(path.clone()),
+        path,
+    });
+    let mut status = world.resource_mut::<SaveStatus>();
+    status.loading = true;
+    status.load = None;
+}
+fn finish_open(world: &mut World) {
+    if !ready(world) {
+        return;
+    }
+    let Some(opening) = world.resource_mut::<GigasaverSession>().opening.take() else {
+        return;
+    };
+    let outgoing = world
+        .remove_resource::<Storage>()
+        .expect("installed save storage");
+    world.insert_resource(opening.storage);
+    let result = storage::load(world);
+    match result {
+        Ok(outcome) => {
+            if outcome == LoadOutcome::Missing {
+                storage::clear_scope(world);
+            }
+            *world.resource_mut::<SaveStatus>() = SaveStatus {
+                path: Some(opening.path),
+                load: Some(Ok(outcome)),
+                writable: true,
+                ..Default::default()
+            };
+            world.run_schedule(SaveOpened);
+            reset_deadline(world);
+        }
+        Err(Error::AssetNotReady(_)) => {
+            let storage = world.remove_resource::<Storage>().unwrap();
+            world.insert_resource(outgoing);
+            world.resource_mut::<GigasaverSession>().opening = Some(Opening {
+                path: opening.path,
+                storage,
+            });
+        }
+        Err(error) => {
+            world.insert_resource(outgoing);
+            let writable = storage::can_save(world);
+            let mut status = world.resource_mut::<SaveStatus>();
+            status.loading = false;
+            status.load = Some(Err(error.to_string()));
+            status.writable = writable;
+        }
+    }
+}
+fn process(world: &mut World) {
+    if world.resource::<GigasaverSession>().opening.is_some() {
+        finish_open(world);
+        if world.resource::<GigasaverSession>().opening.is_some() {
+            return;
+        }
+    }
+    let mut prepared = world.resource_mut::<GigasaverSession>().prepared.take();
+    let requested = prepared.is_some() || !world.resource::<GigasaverSession>().requests.is_empty();
+    loop {
+        let already_prepared = prepared.is_some();
+        let Some(request) = prepared.take().or_else(|| {
+            world
+                .resource_mut::<GigasaverSession>()
+                .requests
+                .pop_front()
+        }) else {
+            break;
+        };
+        // A preparation schedule is optional. Ordinary games save immediately;
+        // gameplay settlement commands get a normal cleanup frame when installed.
+        let has_preparation = world
+            .resource::<Schedules>()
+            .get(PrepareSave)
+            .is_some_and(|schedule| schedule.systems_len() > 0);
+        if !already_prepared
+            && !matches!(request, SaveRequest::Load)
+            && world.resource::<SaveStatus>().writable
+            && has_preparation
+        {
+            world.run_schedule(PrepareSave);
+            world.flush();
+            world.resource_mut::<GigasaverSession>().prepared = Some(request);
+            return;
+        }
         match request {
             SaveRequest::Save => {
-                saved_current = Some(ready_save(world).is_ok());
+                let _ = save(world);
             }
             SaveRequest::Load => {
-                let _ = world.load();
-                saved_current = None;
+                if let Some(path) = world.resource::<SaveStatus>().path.clone() {
+                    begin_open(world, path);
+                }
             }
             SaveRequest::Open(path) => {
-                if outgoing_save(world).is_err() {
-                    saved_current = Some(false);
+                if outgoing(world) && save(world).is_err() {
                     continue;
                 }
-                world.insert_resource(storage::Storage::new(path.clone()));
-                world.insert_resource(SaveStatus::new(path));
-                world.resource_mut::<Registry>().generation = None;
-                let result = storage::load(world);
-                if matches!(result, Ok(LoadOutcome::Missing)) {
-                    storage::clear_scope(world);
-                }
-                record_load(world, &result);
-                saved_current = None; // outgoing commit belongs to the previous file
+                begin_open(world, path);
             }
             SaveRequest::Close => {
-                if outgoing_save(world).is_err() {
-                    saved_current = Some(false);
-                    continue;
+                if outgoing(world) {
+                    if save(world).is_err() {
+                        continue;
+                    }
+                    storage::clear_scope(world);
+                    world.resource_mut::<Storage>().close();
+                    *world.resource_mut::<SaveStatus>() = SaveStatus::default();
+                    world.run_schedule(SaveClosed);
                 }
-                storage::clear_scope(world);
-                world.resource_mut::<storage::Storage>().close();
-                world.resource_mut::<SaveStatus>().writable = false;
+            }
+        }
+        if world.resource::<GigasaverSession>().opening.is_some() {
+            finish_open(world);
+            if world.resource::<GigasaverSession>().opening.is_some() {
+                return;
             }
         }
     }
-    if exiting {
-        if !world.resource::<storage::Storage>().closed
-            && world.resource::<Registry>().started
-            && !saved_current.unwrap_or_else(|| ready_save(world).is_ok())
-        {
-            world.write_message(AppExit::error());
-        }
-    } else if due && !suppress_autosave && world.resource::<SaveStatus>().can_save() {
-        let _ = ready_save(world);
-    }
-}
-
-fn outgoing_save(world: &mut World) -> Result<(), Error> {
-    // A never-opened or failed-to-load destination owns no writable session.
-    // A failed *first save* still owns its unsaved live state and must be retried.
-    if world.resource::<storage::Storage>().closed
-        || !world.resource::<Registry>().started
-        || world
-            .resource::<SaveStatus>()
-            .load()
-            .is_some_and(Result::is_err)
+    let now = world
+        .get_resource::<Time<Real>>()
+        .map_or(Duration::ZERO, |time| time.elapsed());
+    if !requested
+        && world.resource::<SaveStatus>().writable
+        && now >= world.resource::<GigasaverSession>().deadline
     {
-        return Ok(());
+        if ready(world) {
+            let result = storage::save(world);
+            record_save(world, &result);
+        } else {
+            record_save(world, &Err(Error::NotReady));
+        }
+        reset_deadline(world);
     }
-    ready_save(world).map(|_| ())
 }
-
-fn ready_save(world: &mut World) -> Result<SaveStats, Error> {
-    world.run_schedule(CheckReadiness);
-    if !world.resource::<Automation>().enabled {
-        let result = Err(Error::NotReady);
-        record_save(world, &result);
-        return result;
-    }
-    world.save()
+fn outgoing(world: &World) -> bool {
+    !world.resource::<Storage>().closed
+        && (world.resource::<SaveStatus>().writable
+            || (world.resource::<Registry>().started
+                && world.resource::<SaveStatus>().load.is_none()))
 }
-
 pub(crate) fn record_save(world: &mut World, result: &Result<SaveStats, Error>) {
-    let writable = storage::can_save(world);
     let mut status = world.resource_mut::<SaveStatus>();
     status.last_save = Some(result.as_ref().copied().map_err(ToString::to_string));
-    status.writable = writable;
     if result.is_ok() {
+        status.writable = true;
         reset_deadline(world);
     }
 }
-
 pub(crate) fn record_load(world: &mut World, result: &Result<LoadOutcome, Error>) {
     let writable = storage::can_save(world);
-    {
-        let mut status = world.resource_mut::<SaveStatus>();
-        status.load = Some(result.as_ref().copied().map_err(ToString::to_string));
-        status.writable = writable;
-    }
+    let mut status = world.resource_mut::<SaveStatus>();
+    status.load = Some(result.as_ref().copied().map_err(ToString::to_string));
+    status.writable = writable;
     if result.is_ok() {
-        world.run_schedule(SaveLoaded);
+        world.run_schedule(SaveOpened);
         reset_deadline(world);
-    }
-}
-
-fn reset_deadline(world: &mut World) {
-    if let Some(time) = world.get_resource::<Time<Real>>() {
-        let now = time.elapsed();
-        let mut automation = world.resource_mut::<Automation>();
-        automation.deadline = now.saturating_add(automation.interval.unwrap_or(Duration::MAX));
     }
 }

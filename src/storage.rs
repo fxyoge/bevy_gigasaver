@@ -59,6 +59,14 @@ pub enum Error {
     Conflict { expected: u64, actual: u64 },
     #[error("invalid save data: {0}")]
     InvalidData(String),
+    #[error("waiting for asset: {0}")]
+    AssetNotReady(String),
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::InvalidData(error.to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,8 +231,9 @@ pub(crate) fn save(world: &mut World) -> Result<SaveStats, Error> {
         let mut batch = Batch::default();
         let baseline = registry.baseline;
         entity::saving(world.resource::<Identities>().entries.clone(), || {
+            let mut contexts = Vec::new();
             for entry in &mut registry.entries {
-                entry.codec.capture(world, baseline, &mut batch)?;
+                contexts.extend(entry.codec.capture(world, baseline, &mut batch)?);
             }
             Ok::<_, Error>(())
         })?;
@@ -400,11 +409,10 @@ pub(crate) fn clear_scope(world: &mut World) {
             world.despawn(entity);
         }
         for entry in &registry.entries {
-            entry
-                .codec
-                .decode(Vec::new())
-                .expect("empty persistence scope decodes")
-                .apply(world, &HashMap::new(), &mut EntityHashMap::default());
+            entry.codec.clear(world);
+        }
+        for entry in &registry.entries {
+            entry.codec.initialize(world);
         }
         world.insert_resource(Identities::default());
         for entry in &mut registry.entries {
@@ -455,7 +463,7 @@ fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
                 .prepare("SELECT id FROM entities WHERE id != 0 ORDER BY id")?
                 .query_map([], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut records: HashMap<String, Vec<(i64, Vec<u8>)>> = HashMap::new();
+            let mut records: BTreeMap<String, Vec<(i64, Vec<u8>)>> = BTreeMap::new();
             {
                 let mut statement =
                     transaction.prepare("SELECT entity, type_key, payload FROM records")?;
@@ -562,83 +570,96 @@ fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
             saved_ids.retain(|id| retained.contains(id));
         }
         check_manifest(&manifest, &registry)?;
-        let placeholders: HashMap<_, _> = saved_ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| {
-                let index = u32::try_from(index)
-                    .map_err(|_| Error::InvalidData("too many entities".into()))?;
-                let entity = Entity::from_raw_u32(index)
-                    .ok_or_else(|| Error::InvalidData("too many entities".into()))?;
-                Ok((*id, entity))
-            })
-            .collect::<Result<_, Error>>()?;
-        let decoded = entity::loading(Arc::new(placeholders.clone()), || {
-            registry
-                .entries
-                .iter()
-                .map(|entry| {
-                    entry
-                        .codec
-                        .decode(records.remove(entry.key).unwrap_or_default())
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        if !records.is_empty() {
-            return Err(Error::InvalidData("unknown record type".into()));
-        }
-        let next = saved_ids
-            .last()
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidData("persistent entity IDs exhausted".into()))?;
-
-        // Reconcile filters before deciding which live entities belong to us.
-        for entry in &mut registry.entries {
-            entry.codec.reconcile(world);
-        }
-        let old: Vec<_> = world
-            .resource::<Identities>()
-            .entries
-            .iter()
-            .filter(|(_, identity)| identity.memberships > 0)
-            .map(|(entity, _)| *entity)
-            .collect();
-        world.resource_mut::<Identities>().suspended = true;
-        for entity in old {
-            world.despawn(entity);
-        }
-        let actual: HashMap<_, _> = saved_ids
-            .into_iter()
-            .map(|id| (id, world.spawn_empty().id()))
-            .collect();
-        let mut mapper: EntityHashMap<Entity> = placeholders
-            .iter()
-            .map(|(id, placeholder)| (*placeholder, actual[id]))
-            .collect();
-        for value in decoded {
-            value.apply(world, &actual, &mut mapper);
-        }
-        world.flush();
-        let identities = Identities {
-            entries: Arc::new(
-                actual
-                    .into_iter()
-                    .map(|(id, entity)| (entity, Identity { id, memberships: 0 }))
-                    .collect(),
-            ),
-            next,
-            ..Default::default()
-        };
-        world.insert_resource(identities);
-        for entry in &mut registry.entries {
-            entry.codec.reset(world);
-        }
+        restore_records(world, &mut registry, saved_ids, records)?;
         registry.baseline = false;
         registry.generation = Some(saved_generation as u64);
         registry.rewrite_manifest = version != world.resource::<Schema>().version;
         world.increment_change_tick();
         Ok(LoadOutcome::Loaded)
     })
+}
+
+pub(crate) fn restore_records(
+    world: &mut World,
+    registry: &mut Registry,
+    saved_ids: Vec<i64>,
+    mut records: BTreeMap<String, Vec<(i64, Vec<u8>)>>,
+) -> Result<(), Error> {
+    let next = saved_ids
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidData("persistent entity IDs exhausted".into()))?;
+    let actual: HashMap<_, _> = saved_ids
+        .into_iter()
+        .map(|id| (id, world.spawn_empty().id()))
+        .collect();
+    let prepared = entity::loading(
+        Arc::new(actual.clone()),
+        world.get_resource::<bevy_asset::AssetServer>().cloned(),
+        || {
+            let mut decoded = Vec::new();
+            for entry in &registry.entries {
+                decoded.push(
+                    entry
+                        .codec
+                        .decode(world, records.remove(entry.key).unwrap_or_default())?,
+                );
+            }
+            if !records.is_empty() {
+                return Err(Error::InvalidData("unknown record type".into()));
+            }
+            Ok(decoded)
+        },
+    );
+    let decoded = match prepared {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            for entity in actual.values() {
+                world.despawn(*entity);
+            }
+            return Err(error);
+        }
+    };
+    for entry in &mut registry.entries {
+        entry.codec.reconcile(world);
+    }
+    let old: Vec<_> = world
+        .resource::<Identities>()
+        .entries
+        .iter()
+        .filter(|(_, identity)| identity.memberships > 0)
+        .map(|(entity, _)| *entity)
+        .collect();
+    world.resource_mut::<Identities>().suspended = true;
+    for entity in old {
+        world.despawn(entity);
+    }
+    world.flush();
+    for entry in &registry.entries {
+        entry.codec.clear(world);
+    }
+    let mut mapper: EntityHashMap<Entity> =
+        actual.values().map(|entity| (*entity, *entity)).collect();
+    for value in decoded {
+        value.apply(world, &actual, &mut mapper);
+    }
+    world.flush();
+    world.insert_resource(Identities {
+        entries: Arc::new(
+            actual
+                .into_iter()
+                .map(|(id, entity)| (entity, Identity { id, memberships: 0 }))
+                .collect(),
+        ),
+        next,
+        ..Default::default()
+    });
+    for entry in &mut registry.entries {
+        entry.codec.reset(world);
+    }
+    registry.baseline = false;
+    world.increment_change_tick();
+    Ok(())
 }

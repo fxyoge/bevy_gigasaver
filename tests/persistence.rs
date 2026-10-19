@@ -1,7 +1,7 @@
 use bevy_app::App;
 use bevy_ecs::{entity::MapEntities, prelude::*, system::RunSystemOnce};
 use bevy_gigasaver::{
-    AppSaveExt, Capture, Dirty, Error, LoadOutcome, SavePlugin, WorldSaveExt, component, resource,
+    AppSaveExt, Capture, Dirty, Error, LoadOutcome, SavePlugin, WorldSaveExt, component,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ struct Position {
 #[derive(Component, Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct Label(String);
 
-#[derive(Resource, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Resource, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct Clock(u64);
 
 #[derive(Component)]
@@ -29,7 +29,7 @@ fn app(path: &Path, strategy: Capture) -> App {
     app.add_plugins(SavePlugin::sqlite(path))
         .persist(component::<Position>("position").capture(strategy))
         .persist(component::<Label>("label").capture(strategy))
-        .persist(resource::<Clock>("clock"));
+        .persist_resource::<Clock>("clock");
     app
 }
 
@@ -102,6 +102,8 @@ fn strategies_restore_identical_state_and_preserve_unrelated_data() {
 fn changed_ticks_are_relative_to_commits_not_frames_or_world_clear_trackers() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = app(&directory.path().join("save.sqlite"), Capture::Changed);
+    app.update();
+    app.world_mut().remove_resource::<Clock>();
     let entity = app.world_mut().spawn(Position { name: 1, value: 1 }).id();
     assert_eq!(app.world_mut().save().unwrap().upserts, 1);
     assert_eq!(app.world_mut().save().unwrap().upserts, 0);
@@ -229,10 +231,18 @@ struct Focus {
     target: Entity,
 }
 
+impl Default for Focus {
+    fn default() -> Self {
+        Self {
+            target: Entity::PLACEHOLDER,
+        }
+    }
+}
+
 fn graph_app(path: &Path, strategy: Capture) -> App {
     let mut app = app(path, strategy);
     app.persist(component::<Link>("link").capture(strategy))
-        .persist(resource::<Focus>("focus").map_entities());
+        .persist_resource::<Focus>("focus");
     app
 }
 
