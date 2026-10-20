@@ -334,7 +334,96 @@ fn removing_a_referenced_entity_during_migration_does_not_leave_a_phantom_target
     }))
     .persist(component::<OldNode>("old_node"))
     .persist_resource::<Obsolete>("obsolete");
-    assert!(matches!(app.world_mut().load(), Err(Error::Decode { .. })));
+    assert!(
+        matches!(app.world_mut().load(), Err(Error::InvalidData(message)) if message.contains("without a restored owner"))
+    );
     assert!(matches!(app.world_mut().save(), Err(Error::LoadRequired)));
     assert_old_readable(&path);
+}
+
+#[test]
+fn checkpoints_use_application_migrations_and_preserve_reference_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unused.sqlite");
+    let mut source = old(&path);
+    let a = source.world_mut().spawn_empty().id();
+    let b = source.world_mut().spawn_empty().id();
+    source
+        .world_mut()
+        .entity_mut(a)
+        .insert(OldNode { amount: 3, peer: b });
+    source
+        .world_mut()
+        .entity_mut(b)
+        .insert(OldNode { amount: 7, peer: a });
+    let checkpoint = bevy_gigasaver::Checkpoint::capture(source.world_mut()).unwrap();
+    let checkpoint: bevy_gigasaver::Checkpoint =
+        serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut target = current(&path, calls.clone());
+    checkpoint.restore(target.world_mut()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(target.world().resource::<Settings>().enabled);
+    let nodes: Vec<_> = target
+        .world_mut()
+        .query::<(Entity, &Node)>()
+        .iter(target.world())
+        .map(|(e, n)| (e, n.count.clone(), n.target))
+        .collect();
+    assert_eq!(nodes.len(), 2);
+    for (entity, _, peer) in nodes {
+        assert_eq!(target.world().get::<Node>(peer).unwrap().target, entity);
+    }
+    assert!(!path.exists());
+
+    let mut failing = App::new();
+    failing
+        .add_plugins(
+            SavePlugin::sqlite(&path)
+                .version(2)
+                .migrate(1, |_| Err("deliberate failure".into())),
+        )
+        .persist(component::<OldNode>("old_node"))
+        .persist_resource::<Obsolete>("obsolete");
+    let survivor = failing.world_mut().spawn_empty().id();
+    failing.world_mut().entity_mut(survivor).insert(OldNode {
+        amount: 99,
+        peer: survivor,
+    });
+    assert!(matches!(
+        checkpoint.restore(failing.world_mut()),
+        Err(Error::Migration { .. })
+    ));
+    assert_eq!(failing.world().get::<OldNode>(survivor).unwrap().amount, 99);
+    assert!(!path.exists());
+}
+
+#[test]
+fn newly_registered_resources_default_but_saved_absence_stays_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("save.sqlite");
+    let mut source = old(&path);
+    source.world_mut().remove_resource::<Obsolete>();
+    source.world_mut().save().unwrap();
+    let checkpoint = bevy_gigasaver::Checkpoint::capture(source.world_mut()).unwrap();
+    for use_checkpoint in [true, false] {
+        let mut target = old(&path);
+        target
+            .persist_resource::<Settings>("settings")
+            .insert_resource(Settings { enabled: true });
+        if use_checkpoint {
+            checkpoint.restore(target.world_mut()).unwrap();
+        } else {
+            target.world_mut().load().unwrap();
+        }
+        assert!(!target.world().resource::<Settings>().enabled);
+        assert!(!target.world().contains_resource::<Obsolete>());
+        if !use_checkpoint {
+            target.world_mut().save().unwrap();
+            let mut reloaded = old(&path);
+            reloaded.persist_resource::<Settings>("settings");
+            reloaded.world_mut().load().unwrap();
+            assert!(!reloaded.world().resource::<Settings>().enabled);
+        }
+    }
 }

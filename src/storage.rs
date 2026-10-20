@@ -1,7 +1,7 @@
 use crate::{
     LoadOutcome, entity,
     identity::{Identities, Identity},
-    migration::{MigrationData, SavedType, Schema},
+    migration::{Schema, migrate_records},
     registration::{Batch, Registry},
 };
 use bevy_ecs::{
@@ -208,6 +208,22 @@ fn check_manifest(actual: &BTreeMap<String, i64>, registry: &Registry) -> Result
         .collect();
     if *actual != expected {
         return Err(Error::Manifest);
+    }
+    Ok(())
+}
+
+pub(crate) fn check_load_manifest(
+    actual: &BTreeMap<String, i64>,
+    registry: &Registry,
+) -> Result<(), Error> {
+    for (key, kind) in actual {
+        if !registry
+            .entries
+            .iter()
+            .any(|entry| entry.key == key && entry.kind == *kind)
+        {
+            return Err(Error::Manifest);
+        }
     }
     Ok(())
 }
@@ -486,94 +502,20 @@ fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
             transaction.commit()?;
             Ok::<_, Error>(Some((saved_generation, ids, records, manifest, version)))
         })?;
-        let Some((saved_generation, mut saved_ids, mut records, mut manifest, version)) = saved
-        else {
+        let Some((saved_generation, saved_ids, mut records, mut manifest, version)) = saved else {
             registry.baseline = false;
             registry.generation = Some(0);
             registry.rewrite_manifest = false;
             return Ok(LoadOutcome::Missing);
         };
         let schema = world.resource::<Schema>();
-        if version > schema.version {
-            return Err(Error::NewerSchema {
-                saved: version,
-                supported: schema.version,
-            });
-        }
-        if version < schema.version {
-            let mut data = MigrationData::new();
-            for (key, kind) in &manifest {
-                let rows = records.remove(key).unwrap_or_default();
-                let mut values = BTreeMap::new();
-                for (id, bytes) in rows {
-                    if (*kind == 0 && id != 0) || (*kind == 1 && id <= 0) {
-                        return Err(Error::InvalidData("record role mismatch".into()));
-                    }
-                    let value = serde_json::from_slice(&bytes).map_err(|error| {
-                        Error::InvalidData(format!("decoding migration input {key}: {error}"))
-                    })?;
-                    values.insert(id, value);
-                }
-                let value = match kind {
-                    0 => SavedType::Resource(values.remove(&0)),
-                    1 => SavedType::Component(values),
-                    _ => return Err(Error::InvalidData("unknown persistence role".into())),
-                };
-                data.insert(key.clone(), value);
-            }
-            if !records.is_empty() {
-                return Err(Error::InvalidData("unknown record type".into()));
-            }
-            schema.migrate(version, &mut data)?;
-            manifest.clear();
-            for (key, value) in data {
-                let (kind, values) = match value {
-                    SavedType::Resource(value) => (
-                        0,
-                        value
-                            .map(|value| (0, value))
-                            .into_iter()
-                            .collect::<Vec<_>>(),
-                    ),
-                    SavedType::Component(values) => {
-                        if values
-                            .keys()
-                            .any(|id| *id <= 0 || saved_ids.binary_search(id).is_err())
-                        {
-                            return Err(Error::InvalidData(
-                                "migration introduced an unknown component identity".into(),
-                            ));
-                        }
-                        (1, values.into_iter().collect())
-                    }
-                };
-                manifest.insert(key.clone(), kind);
-                records.insert(
-                    key,
-                    values
-                        .into_iter()
-                        .map(|(id, value)| {
-                            serde_json::to_vec(&value)
-                                .map(|bytes| (id, bytes))
-                                .map_err(|error| Error::InvalidData(error.to_string()))
-                        })
-                        .collect::<Result<_, _>>()?,
-                );
-            }
-            // Removing a type must not leave invisible empty entities keeping
-            // references alive. Decoding below rejects references to those IDs.
-            let retained: std::collections::HashSet<_> = records
-                .values()
-                .flatten()
-                .filter_map(|(id, _)| (*id > 0).then_some(*id))
-                .collect();
-            saved_ids.retain(|id| retained.contains(id));
-        }
-        check_manifest(&manifest, &registry)?;
-        restore_records(world, &mut registry, saved_ids, records)?;
+        migrate_records(schema, version, &saved_ids, &mut records, &mut manifest)?;
+        check_load_manifest(&manifest, &registry)?;
+        restore_records(world, &mut registry, saved_ids, records, &manifest)?;
         registry.baseline = false;
         registry.generation = Some(saved_generation as u64);
-        registry.rewrite_manifest = version != world.resource::<Schema>().version;
+        registry.rewrite_manifest = version != world.resource::<Schema>().version
+            || manifest.len() != registry.entries.len();
         world.increment_change_tick();
         Ok(LoadOutcome::Loaded)
     })
@@ -584,6 +526,7 @@ pub(crate) fn restore_records(
     registry: &mut Registry,
     saved_ids: Vec<i64>,
     mut records: BTreeMap<String, Vec<(i64, Vec<u8>)>>,
+    manifest: &BTreeMap<String, i64>,
 ) -> Result<(), Error> {
     let next = saved_ids
         .last()
@@ -591,28 +534,32 @@ pub(crate) fn restore_records(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("persistent entity IDs exhausted".into()))?;
-    let actual: HashMap<_, _> = saved_ids
+    let mut actual: HashMap<_, _> = saved_ids
         .into_iter()
         .map(|id| (id, world.spawn_empty().id()))
         .collect();
-    let prepared = entity::loading(
-        Arc::new(actual.clone()),
-        world.get_resource::<bevy_asset::AssetServer>().cloned(),
-        || {
-            let mut decoded = Vec::new();
-            for entry in &registry.entries {
-                decoded.push(
-                    entry
-                        .codec
-                        .decode(world, records.remove(entry.key).unwrap_or_default())?,
-                );
-            }
-            if !records.is_empty() {
-                return Err(Error::InvalidData("unknown record type".into()));
-            }
-            Ok(decoded)
-        },
-    );
+    let (prepared, references) = entity::references(|| {
+        entity::loading(
+            Arc::new(actual.clone()),
+            world.get_resource::<bevy_asset::AssetServer>().cloned(),
+            || {
+                let mut decoded = Vec::new();
+                for entry in &registry.entries {
+                    decoded.push(if manifest.contains_key(entry.key) {
+                        entry
+                            .codec
+                            .decode(world, records.remove(entry.key).unwrap_or_default())?
+                    } else {
+                        entry.codec.decode_missing(world)?
+                    });
+                }
+                if !records.is_empty() {
+                    return Err(Error::InvalidData("unknown record type".into()));
+                }
+                Ok(decoded)
+            },
+        )
+    });
     let decoded = match prepared {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -622,6 +569,31 @@ pub(crate) fn restore_records(
             return Err(error);
         }
     };
+    let owned: std::collections::HashSet<_> = decoded
+        .iter()
+        .flat_map(|value| value.entities(&actual))
+        .collect();
+    let allocated: std::collections::HashSet<_> = actual.values().copied().collect();
+    if !owned.is_subset(&allocated)
+        || references
+            .iter()
+            .any(|id| !actual.get(id).is_some_and(|entity| owned.contains(entity)))
+    {
+        for entity in actual.values() {
+            world.despawn(*entity);
+        }
+        return Err(Error::InvalidData(
+            "reference to an entity without a restored owner".into(),
+        ));
+    }
+    actual.retain(|_, entity| {
+        if owned.contains(entity) {
+            true
+        } else {
+            world.despawn(*entity);
+            false
+        }
+    });
     for entry in &mut registry.entries {
         entry.codec.reconcile(world);
     }

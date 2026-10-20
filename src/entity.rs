@@ -102,7 +102,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Entity,
 }
 
 pub fn loaded_entity(id: i64) -> Result<Entity, crate::Error> {
-    CONTEXT
+    let entity = CONTEXT
         .with(|slot| match slot.borrow().as_ref() {
             Some(Context::Load(ids, _)) => ids
                 .get(&id)
@@ -110,7 +110,13 @@ pub fn loaded_entity(id: i64) -> Result<Entity, crate::Error> {
                 .ok_or("dangling saved entity reference"),
             _ => Err("entity deserialization requires a restore context"),
         })
-        .map_err(|message| crate::Error::InvalidData(message.into()))
+        .map_err(|message| crate::Error::InvalidData(message.into()))?;
+    REFERENCES.with(|slot| {
+        if let Some(references) = slot.borrow_mut().as_mut() {
+            references.insert(id);
+        }
+    });
+    Ok(entity)
 }
 
 pub mod optional {

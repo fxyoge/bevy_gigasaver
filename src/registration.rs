@@ -295,11 +295,17 @@ pub(crate) trait Codec: Send + Sync {
         world: &mut World,
         records: Vec<(i64, Vec<u8>)>,
     ) -> Result<Box<dyn Decoded>, Error>;
+    fn decode_missing(&self, world: &mut World) -> Result<Box<dyn Decoded>, Error> {
+        self.decode(world, Vec::new())
+    }
     fn acknowledge(&mut self, world: &mut World, tick: Tick);
     fn reset(&mut self, world: &mut World);
 }
 
 pub(crate) trait Decoded {
+    fn entities(&self, _: &std::collections::HashMap<i64, Entity>) -> Vec<Entity> {
+        Vec::new()
+    }
     fn apply(
         self: Box<Self>,
         world: &mut World,
@@ -548,6 +554,9 @@ where
 struct DecodedComponent<T>(Vec<(i64, T)>);
 
 impl<T: Component> Decoded for DecodedComponent<T> {
+    fn entities(&self, ids: &std::collections::HashMap<i64, Entity>) -> Vec<Entity> {
+        self.0.iter().map(|(id, _)| ids[id]).collect()
+    }
     fn apply(
         self: Box<Self>,
         world: &mut World,
@@ -587,6 +596,9 @@ impl<T: Resource + Serialize + DeserializeOwned> From<ResourceSave<T>> for Regis
 }
 
 impl<T: Resource + Serialize + DeserializeOwned> Codec for ResourceCodec<T> {
+    fn decode_missing(&self, _world: &mut World) -> Result<Box<dyn Decoded>, Error> {
+        Ok(Box::new(InitializeResource(self.initialize)))
+    }
     fn initialize(&self, world: &mut World) {
         (self.initialize)(world);
     }
@@ -698,6 +710,19 @@ pub(crate) fn initialize(world: &mut World) {
 
 struct DecodedResource<T> {
     value: Option<T>,
+}
+
+struct InitializeResource(fn(&mut World));
+
+impl Decoded for InitializeResource {
+    fn apply(
+        self: Box<Self>,
+        world: &mut World,
+        _: &std::collections::HashMap<i64, Entity>,
+        _: &mut EntityHashMap<Entity>,
+    ) {
+        (self.0)(world);
+    }
 }
 
 impl<T: Resource> Decoded for DecodedResource<T> {

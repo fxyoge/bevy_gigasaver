@@ -54,3 +54,87 @@ impl Schema {
         Ok(())
     }
 }
+
+pub(crate) type Records = BTreeMap<String, Vec<(i64, Vec<u8>)>>;
+
+/// Shared by SQLite loads and backend-independent checkpoints.
+pub(crate) fn migrate_records(
+    schema: &Schema,
+    version: u32,
+    saved_ids: &[i64],
+    records: &mut Records,
+    manifest: &mut BTreeMap<String, i64>,
+) -> Result<(), Error> {
+    if version == 0 {
+        return Err(Error::InvalidData("zero schema version".into()));
+    }
+    if version > schema.version {
+        return Err(Error::NewerSchema {
+            saved: version,
+            supported: schema.version,
+        });
+    }
+    if version == schema.version {
+        return Ok(());
+    }
+    let mut data = MigrationData::new();
+    for (key, kind) in manifest.iter() {
+        let rows = records.remove(key).unwrap_or_default();
+        let mut values = BTreeMap::new();
+        for (id, bytes) in rows {
+            if (*kind == 0 && id != 0) || (*kind == 1 && id <= 0) {
+                return Err(Error::InvalidData("record role mismatch".into()));
+            }
+            let value = serde_json::from_slice(&bytes).map_err(|error| {
+                Error::InvalidData(format!("decoding migration input {key}: {error}"))
+            })?;
+            if values.insert(id, value).is_some() {
+                return Err(Error::InvalidData(
+                    "duplicate migration record identity".into(),
+                ));
+            }
+        }
+        let value = match kind {
+            0 => SavedType::Resource(values.remove(&0)),
+            1 => SavedType::Component(values),
+            _ => return Err(Error::InvalidData("unknown persistence role".into())),
+        };
+        data.insert(key.clone(), value);
+    }
+    if !records.is_empty() {
+        return Err(Error::InvalidData("unknown record type".into()));
+    }
+    schema.migrate(version, &mut data)?;
+    manifest.clear();
+    for (key, value) in data {
+        let (kind, values) = match value {
+            SavedType::Resource(value) => {
+                (0, value.map(|v| (0, v)).into_iter().collect::<Vec<_>>())
+            }
+            SavedType::Component(values) => {
+                if values
+                    .keys()
+                    .any(|id| *id <= 0 || saved_ids.binary_search(id).is_err())
+                {
+                    return Err(Error::InvalidData(
+                        "migration introduced an unknown component identity".into(),
+                    ));
+                }
+                (1, values.into_iter().collect())
+            }
+        };
+        manifest.insert(key.clone(), kind);
+        records.insert(
+            key,
+            values
+                .into_iter()
+                .map(|(id, value)| {
+                    serde_json::to_vec(&value)
+                        .map(|bytes| (id, bytes))
+                        .map_err(|error| Error::InvalidData(error.to_string()))
+                })
+                .collect::<Result<_, _>>()?,
+        );
+    }
+    Ok(())
+}

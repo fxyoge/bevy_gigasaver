@@ -17,6 +17,9 @@ pub struct Captured {
 }
 
 pub struct Prepared {
+    /// Staged entities owned by this adapter. References alone do not confer
+    /// ownership; migration may remove the last component that owned an entity.
+    pub entities: Vec<Entity>,
     pub apply: Apply,
     pub context: Box<dyn Any>,
 }
@@ -116,6 +119,9 @@ impl<A: SaveAdapter> Codec for AdapterCodec<A> {
 
 struct AdapterDecoded(Prepared);
 impl Decoded for AdapterDecoded {
+    fn entities(&self, _: &HashMap<i64, Entity>) -> Vec<Entity> {
+        self.0.entities.clone()
+    }
     fn apply(
         self: Box<Self>,
         world: &mut World,

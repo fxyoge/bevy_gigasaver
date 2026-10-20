@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     version: u32,
+    schema_version: u32,
     entities: Vec<i64>,
     kinds: BTreeMap<String, i64>,
     data: BTreeMap<String, Vec<(i64, Vec<u8>)>>,
@@ -64,7 +65,10 @@ impl Checkpoint {
                 .collect();
             entities.sort();
             Ok(Self {
-                version: 1,
+                version: 2,
+                schema_version: world
+                    .get_resource::<crate::migration::Schema>()
+                    .map_or(1, |s| s.version),
                 entities,
                 kinds: registry
                     .entries
@@ -77,7 +81,7 @@ impl Checkpoint {
     }
 
     pub fn restore(&self, world: &mut World) -> Result<(), Error> {
-        if self.version != 1
+        if self.version != 2
             || self.entities.iter().any(|id| *id <= 0)
             || self.entities.windows(2).any(|ids| ids[0] >= ids[1])
         {
@@ -86,21 +90,31 @@ impl Checkpoint {
             ));
         }
         world.flush();
+        let entities = self.entities.clone();
+        let mut kinds = self.kinds.clone();
+        let mut data = self.data.clone();
+        let schema = world
+            .get_resource::<crate::migration::Schema>()
+            .cloned()
+            .unwrap_or_default();
+        crate::migration::migrate_records(
+            &schema,
+            self.schema_version,
+            &entities,
+            &mut data,
+            &mut kinds,
+        )?;
         world.resource_scope(|world, mut registry: Mut<Registry>| {
-            let expected: BTreeMap<_, _> = registry
-                .entries
-                .iter()
-                .map(|entry| (entry.key.to_owned(), entry.kind))
-                .collect();
-            if expected != self.kinds || !self.kinds.keys().eq(self.data.keys()) {
+            storage::check_load_manifest(&kinds, &registry)?;
+            if !kinds.keys().eq(data.keys()) {
                 return Err(Error::Manifest);
             }
-            for (key, records) in &self.data {
-                let kind = self.kinds[key];
+            for (key, records) in &data {
+                let kind = kinds[key];
                 if records.windows(2).any(|values| values[0].0 >= values[1].0)
                     || records.iter().any(|(id, _)| match kind {
                         0 => *id != 0,
-                        1 => self.entities.binary_search(id).is_err(),
+                        1 => entities.binary_search(id).is_err(),
                         _ => true,
                     })
                 {
@@ -109,12 +123,7 @@ impl Checkpoint {
                     ));
                 }
             }
-            storage::restore_records(
-                world,
-                &mut registry,
-                self.entities.clone(),
-                self.data.clone(),
-            )?;
+            storage::restore_records(world, &mut registry, entities, data, &kinds)?;
             registry.started = true;
             Ok(())
         })
