@@ -1,7 +1,6 @@
 use crate::{
     LoadOutcome, entity,
     identity::{Identities, Identity},
-    migration::{Schema, migrate_records},
     registration::{Batch, Registry},
 };
 use bevy_ecs::{
@@ -17,7 +16,7 @@ use std::{
 };
 
 const APPLICATION_ID: i64 = 0x4749_4741;
-const FORMAT: i64 = 2;
+const FORMAT: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -45,12 +44,6 @@ pub enum Error {
     LoadRequired,
     #[error("save file: {0}")]
     Io(#[from] std::io::Error),
-    #[error("save schema {saved} is newer than supported schema {supported}")]
-    NewerSchema { saved: u32, supported: u32 },
-    #[error("missing migration from schema {0}")]
-    MissingMigration(u32),
-    #[error("migration from schema {from}: {message}")]
-    Migration { from: u32, message: String },
     #[error("unrecognized database or unsupported save format")]
     Format,
     #[error("persistent type keys/roles do not match this save's manifest")]
@@ -131,13 +124,12 @@ impl Storage {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(
                     "PRAGMA application_id = 1195984705;
-                     PRAGMA user_version = 2;
+                     PRAGMA user_version = 1;
                      CREATE TABLE meta (
                          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                         generation INTEGER NOT NULL CHECK(generation >= 0),
-                         schema_version INTEGER NOT NULL CHECK(schema_version > 0)
+                         generation INTEGER NOT NULL CHECK(generation >= 0)
                      ) STRICT;
-                     INSERT INTO meta VALUES (1, 0, 1);
+                     INSERT INTO meta VALUES (1, 0);
                      CREATE TABLE types (
                          key TEXT PRIMARY KEY, kind INTEGER NOT NULL CHECK(kind IN (0, 1))
                      ) STRICT;
@@ -163,7 +155,7 @@ impl Storage {
                 return Err(Error::Format);
             }
             let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if version != 1 && version != FORMAT {
+            if version != FORMAT {
                 return Err(Error::Format);
             }
             connection.busy_timeout(Duration::from_secs(5))?;
@@ -265,7 +257,6 @@ pub(crate) fn save(world: &mut World) -> Result<SaveStats, Error> {
                 &registry,
                 world.resource::<Identities>(),
                 &batch,
-                world.resource::<Schema>().version,
             )
         })?;
         for entry in &mut registry.entries {
@@ -286,7 +277,6 @@ fn commit(
     registry: &Registry,
     ids: &Identities,
     batch: &Batch,
-    schema_version: u32,
 ) -> Result<SaveStats, Error> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous = generation(&transaction)?;
@@ -303,11 +293,6 @@ fn commit(
     let next = previous
         .checked_add(1)
         .ok_or_else(|| Error::InvalidData("generation exhausted".into()))?;
-    // Upgrade the storage layout only inside the successful save transaction.
-    let format: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if format == 1 {
-        transaction.execute_batch("ALTER TABLE meta ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version > 0); PRAGMA user_version = 2;")?;
-    }
     let mut deletions = 0;
     if registry.rewrite_manifest {
         deletions += transaction.execute("DELETE FROM records", [])?;
@@ -370,8 +355,8 @@ fn commit(
         }
     }
     transaction.execute(
-        "UPDATE meta SET generation = ?1, schema_version = ?2 WHERE singleton = 1",
-        params![next, schema_version],
+        "UPDATE meta SET generation = ?1 WHERE singleton = 1",
+        [next],
     )?;
     transaction.commit()?;
     Ok(SaveStats {
@@ -462,19 +447,6 @@ fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
                 return Ok(None);
             }
             let manifest = read_manifest(&transaction)?;
-            let format: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            let version = if format == 1 {
-                1
-            } else {
-                transaction.query_row(
-                    "SELECT schema_version FROM meta WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, u32>(0),
-                )?
-            };
-            if version == 0 {
-                return Err(Error::InvalidData("zero schema version".into()));
-            }
             let ids = transaction
                 .prepare("SELECT id FROM entities WHERE id != 0 ORDER BY id")?
                 .query_map([], |row| row.get::<_, i64>(0))?
@@ -500,22 +472,19 @@ fn load_inner(world: &mut World) -> Result<LoadOutcome, Error> {
                 }
             }
             transaction.commit()?;
-            Ok::<_, Error>(Some((saved_generation, ids, records, manifest, version)))
+            Ok::<_, Error>(Some((saved_generation, ids, records, manifest)))
         })?;
-        let Some((saved_generation, saved_ids, mut records, mut manifest, version)) = saved else {
+        let Some((saved_generation, saved_ids, records, manifest)) = saved else {
             registry.baseline = false;
             registry.generation = Some(0);
             registry.rewrite_manifest = false;
             return Ok(LoadOutcome::Missing);
         };
-        let schema = world.resource::<Schema>();
-        migrate_records(schema, version, &saved_ids, &mut records, &mut manifest)?;
         check_load_manifest(&manifest, &registry)?;
         restore_records(world, &mut registry, saved_ids, records, &manifest)?;
         registry.baseline = false;
         registry.generation = Some(saved_generation as u64);
-        registry.rewrite_manifest = version != world.resource::<Schema>().version
-            || manifest.len() != registry.entries.len();
+        registry.rewrite_manifest = manifest.len() != registry.entries.len();
         world.increment_change_tick();
         Ok(LoadOutcome::Loaded)
     })

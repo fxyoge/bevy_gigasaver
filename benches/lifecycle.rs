@@ -1,8 +1,6 @@
 use bevy_app::{App, Update};
 use bevy_ecs::prelude::*;
-use bevy_gigasaver::{
-    AppSaveExt, Capture, SavePlugin, SaveStatus, SavedType, WorldSaveExt, component,
-};
+use bevy_gigasaver::{AppSaveExt, Capture, SavePlugin, SaveStatus, WorldSaveExt, component};
 use bevy_time::{Real, Time};
 use divan::{Bencher, black_box};
 use serde::{Deserialize, Serialize};
@@ -83,35 +81,14 @@ fn autosave_frame(bencher: Bencher, entities: usize) {
 
 #[divan::bench(args = [1_000, 10_000], sample_size = 1, sample_count = 20)]
 fn load(bencher: Bencher, entities: usize) {
-    load_case(bencher, entities, false);
-}
-
-#[divan::bench(args = [1_000, 10_000], sample_size = 1, sample_count = 20)]
-fn migrate(bencher: Bencher, entities: usize) {
-    load_case(bencher, entities, true);
-}
-
-fn load_case(bencher: Bencher, entities: usize, migrate: bool) {
     bencher
         .with_inputs(|| {
             let (mut writer, directory) = setup(entities);
             writer.world_mut().save().unwrap();
             drop(writer);
-            let mut plugin = SavePlugin::sqlite(directory.path().join("save.sqlite"));
-            if migrate {
-                plugin = plugin.version(2).migrate(1, |data| {
-                    let SavedType::Component(rows) = data.get_mut("record").unwrap() else {
-                        unreachable!()
-                    };
-                    for value in rows.values_mut() {
-                        value["ticks"] = serde_json::json!(1);
-                    }
-                    Ok(())
-                });
-            }
             let mut reader = App::new();
             reader
-                .add_plugins(plugin)
+                .add_plugins(SavePlugin::sqlite(directory.path().join("save.sqlite")))
                 .persist(component::<Record>("record"));
             (reader, directory)
         })

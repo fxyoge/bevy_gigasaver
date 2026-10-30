@@ -1,7 +1,7 @@
 use bevy_app::App;
 use bevy_ecs::{entity::MapEntities, prelude::*, system::RunSystemOnce};
 use bevy_gigasaver::{
-    AppSaveExt, Capture, Dirty, Error, LoadOutcome, SavePlugin, WorldSaveExt, component,
+    AppSaveExt, Capture, Checkpoint, Dirty, Error, LoadOutcome, SavePlugin, WorldSaveExt, component,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,42 @@ fn missing_resources_remove_the_persisted_value_and_restore_absence() {
     assert!(!app.world().contains_resource::<Clock>());
 }
 
+#[test]
+fn newly_registered_resources_default_but_saved_absence_stays_absent() {
+    #[derive(Resource, Default, Serialize, Deserialize)]
+    struct Settings {
+        enabled: bool,
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("save.sqlite");
+    let mut source = app(&path, Capture::Changed);
+    source.world_mut().remove_resource::<Clock>();
+    source.world_mut().save().unwrap();
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    for use_checkpoint in [true, false] {
+        let mut target = app(&path, Capture::Changed);
+        target
+            .persist_resource::<Settings>("settings")
+            .insert_resource(Settings { enabled: true });
+        if use_checkpoint {
+            checkpoint.restore(target.world_mut()).unwrap();
+        } else {
+            target.world_mut().load().unwrap();
+        }
+        assert!(!target.world().resource::<Settings>().enabled);
+        assert!(!target.world().contains_resource::<Clock>());
+        if !use_checkpoint {
+            target.world_mut().save().unwrap();
+            let mut reloaded = app(&path, Capture::Changed);
+            reloaded.persist_resource::<Settings>("settings");
+            reloaded.world_mut().load().unwrap();
+            assert!(!reloaded.world().resource::<Settings>().enabled);
+            assert!(!reloaded.world().contains_resource::<Clock>());
+        }
+    }
+}
+
 #[derive(Component, Serialize, Deserialize)]
 struct Selected;
 
@@ -297,6 +333,107 @@ fn cyclic_entity_graphs_and_resource_references_remap_across_apps() {
             .unwrap();
         assert_eq!(before, after);
     }
+}
+
+#[test]
+fn checkpoints_roundtrip_reference_identity_without_creating_a_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unused.sqlite");
+    let mut source = graph_app(&path, Capture::Changed);
+    let a = source
+        .world_mut()
+        .spawn(Position { name: 1, value: 10 })
+        .id();
+    let b = source
+        .world_mut()
+        .spawn(Position { name: 2, value: 20 })
+        .id();
+    source.world_mut().entity_mut(a).insert(Link { target: b });
+    source.world_mut().entity_mut(b).insert(Link { target: a });
+    source.insert_resource(Focus { target: a });
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let checkpoint: Checkpoint =
+        serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let mut target = graph_app(&path, Capture::Changed);
+    let unrelated = target.world_mut().spawn(Unrelated).id();
+    checkpoint.restore(target.world_mut()).unwrap();
+    let nodes: Vec<_> = target
+        .world_mut()
+        .query::<(Entity, &Link)>()
+        .iter(target.world())
+        .map(|(entity, link)| (entity, link.target))
+        .collect();
+    assert_eq!(nodes.len(), 2);
+    for (entity, peer) in nodes {
+        assert_eq!(target.world().get::<Link>(peer).unwrap().target, entity);
+    }
+    let focus = target.world().resource::<Focus>().target;
+    assert_eq!(target.world().get::<Position>(focus).unwrap().name, 1);
+    assert_eq!(
+        positions(target.world_mut()),
+        [
+            Position { name: 1, value: 10 },
+            Position { name: 2, value: 20 }
+        ]
+    );
+    assert!(target.world().get::<Unrelated>(unrelated).is_some());
+    assert!(!path.exists());
+}
+
+#[test]
+fn invalid_checkpoint_identities_preserve_live_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unused.sqlite");
+    let mut app = app(&path, Capture::Changed);
+    let entity = app.world_mut().spawn(Position { name: 1, value: 10 }).id();
+    app.insert_resource(Clock(7));
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let wire = serde_json::to_value(checkpoint).unwrap();
+    app.world_mut().get_mut::<Position>(entity).unwrap().value = 42;
+    app.insert_resource(Clock(42));
+    let count = app.world().entities().len();
+    for duplicate_entity in [true, false] {
+        let mut invalid = wire.clone();
+        if duplicate_entity {
+            let id = invalid["entities"][0].clone();
+            invalid["entities"].as_array_mut().unwrap().push(id);
+        } else {
+            invalid["data"]["position"][0][0] = (-1).into();
+        }
+        let invalid: Checkpoint = serde_json::from_value(invalid).unwrap();
+        assert!(matches!(
+            invalid.restore(app.world_mut()),
+            Err(Error::InvalidData(_))
+        ));
+        assert_eq!(app.world().get::<Position>(entity).unwrap().value, 42);
+        assert_eq!(app.world().resource::<Clock>().0, 42);
+        assert_eq!(app.world().entities().len(), count);
+    }
+    assert!(!path.exists());
+}
+
+#[test]
+fn mismatched_checkpoint_manifest_preserves_live_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unused.sqlite");
+    let mut app = app(&path, Capture::Changed);
+    let entity = app.world_mut().spawn(Position { name: 1, value: 10 }).id();
+    app.insert_resource(Clock(7));
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let mut wire = serde_json::to_value(checkpoint).unwrap();
+    wire["kinds"]["position"] = 0.into();
+    let invalid: Checkpoint = serde_json::from_value(wire).unwrap();
+    app.world_mut().get_mut::<Position>(entity).unwrap().value = 42;
+    app.insert_resource(Clock(42));
+    let count = app.world().entities().len();
+    assert!(matches!(
+        invalid.restore(app.world_mut()),
+        Err(Error::Manifest)
+    ));
+    assert_eq!(app.world().get::<Position>(entity).unwrap().value, 42);
+    assert_eq!(app.world().resource::<Clock>().0, 42);
+    assert_eq!(app.world().entities().len(), count);
+    assert!(!path.exists());
 }
 
 #[test]

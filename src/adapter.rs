@@ -18,7 +18,7 @@ pub struct Captured {
 
 pub struct Prepared {
     /// Staged entities owned by this adapter. References alone do not confer
-    /// ownership; migration may remove the last component that owned an entity.
+    /// ownership.
     pub entities: Vec<Entity>,
     pub apply: Apply,
     pub context: Box<dyn Any>,

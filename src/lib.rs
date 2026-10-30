@@ -26,7 +26,6 @@ pub mod adapter;
 mod checkpoint;
 mod identity;
 mod lifecycle;
-mod migration;
 mod registration;
 mod storage;
 pub use bevy_gigasaver_macros::save;
@@ -39,7 +38,6 @@ pub mod entity;
 pub use lifecycle::{
     PrepareSave, SaveClosed, SaveOpened, SaveRequest, SaveSet, SaveSettings, SaveStatus,
 };
-pub use migration::{MigrationData, SavedType};
 pub use registration::{AppSaveExt, Capture, ComponentSave, Dirty, Registration, component};
 pub use storage::{Error, SaveStats};
 
@@ -64,7 +62,6 @@ type ConfigureReadiness = Box<dyn Fn(&mut App) + Send + Sync>;
 #[derive(Default)]
 pub struct SavePlugin {
     path: Option<PathBuf>,
-    schema: migration::Schema,
     load_on_start: bool,
     interval: Option<Duration>,
     readiness: Option<ConfigureReadiness>,
@@ -74,7 +71,6 @@ impl SavePlugin {
     pub fn sqlite(path: impl AsRef<Path>) -> Self {
         Self {
             path: Some(path.as_ref().to_owned()),
-            schema: migration::Schema::default(),
             load_on_start: true,
             interval: None,
             readiness: None,
@@ -109,39 +105,12 @@ impl SavePlugin {
         }));
         self
     }
-
-    /// Application schema version, independent of Gigasaver's storage format.
-    /// Existing pre-versioning saves are application version 1.
-    pub fn version(mut self, version: u32) -> Self {
-        assert!(version > 0, "schema version must be positive");
-        self.schema.version = version;
-        self
-    }
-
-    /// Registers a `from` -> `from + 1` transformation. Runs on staged data;
-    /// errors block saving and leave the committed save untouched.
-    pub fn migrate(
-        mut self,
-        from: u32,
-        step: impl Fn(&mut MigrationData) -> Result<(), String> + Send + Sync + 'static,
-    ) -> Self {
-        assert!(from > 0 && from < u32::MAX, "invalid migration version");
-        assert!(
-            self.schema
-                .steps
-                .insert(from, std::sync::Arc::new(step))
-                .is_none(),
-            "duplicate migration step"
-        );
-        self
-    }
 }
 
 impl Plugin for SavePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<identity::Identities>()
             .init_resource::<registration::Registry>()
-            .insert_resource(self.schema.clone())
             .insert_resource(SaveStatus::new(self.path.clone()))
             .insert_resource(storage::Storage::new(self.path.clone().unwrap_or_default()));
         if self.path.is_none() {

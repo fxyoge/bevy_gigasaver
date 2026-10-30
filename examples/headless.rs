@@ -1,10 +1,8 @@
 //! cargo run --example headless -- /tmp/gigasaver-example.sqlite
-//! Run twice to resume. `--legacy` creates/runs the version-1 application;
-//! running without it then demonstrates migration to version 2.
 use bevy_app::{App, AppExit, Update};
 use bevy_ecs::prelude::*;
 use bevy_gigasaver::{
-    AppSaveExt, Capture, LoadOutcome, SaveOpened, SavePlugin, SaveStatus, SavedType, component,
+    AppSaveExt, Capture, LoadOutcome, SaveOpened, SavePlugin, SaveStatus, component,
 };
 use bevy_time::TimePlugin;
 use serde::{Deserialize, Serialize};
@@ -21,11 +19,6 @@ struct Node {
 #[derive(Resource, Default, Serialize, Deserialize)]
 struct Account {
     credits: u64,
-}
-
-#[derive(Resource, Default, Serialize, Deserialize)]
-struct LegacyAccount {
-    balance: u64,
 }
 
 #[derive(Component)]
@@ -49,36 +42,14 @@ fn simulate(mut nodes: Query<&mut Node>) {
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    let legacy = args.iter().any(|arg| arg == "--legacy");
-    let path = args
-        .iter()
-        .find(|arg| arg.as_str() != "--legacy")
+    let path = std::env::args_os()
+        .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| "save.sqlite".into());
     let mut app = App::new();
     app.add_plugins(TimePlugin);
     let plugin = SavePlugin::sqlite(&path).autosave(Duration::from_millis(250));
-    if legacy {
-        app.add_plugins(plugin)
-            .persist_resource::<LegacyAccount>("account")
-            .add_systems(
-                SaveOpened,
-                (|mut commands: Commands| {
-                    commands.insert_resource(LegacyAccount { balance: 10 });
-                })
-                .run_if(fresh),
-            );
-    } else {
-        app.add_plugins(plugin.version(2).migrate(1, |data| {
-            let Some(SavedType::Resource(Some(account))) = data.get_mut("account") else {
-                return Err("missing account".into());
-            };
-            let account = account.as_object_mut().ok_or("account must be an object")?;
-            let balance = account.remove("balance").ok_or("missing balance")?;
-            account.insert("credits".into(), balance);
-            Ok(())
-        }))
+    app.add_plugins(plugin)
         .persist_resource::<Account>("account")
         .add_systems(
             SaveOpened,
@@ -87,7 +58,6 @@ fn main() {
             })
             .run_if(fresh),
         );
-    }
     app.persist(component::<Node>("node").capture(Capture::Changed))
         .add_systems(SaveOpened, initialize.run_if(fresh))
         .add_systems(Update, simulate);
