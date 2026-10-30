@@ -46,13 +46,16 @@ fn commit(bencher: Bencher, entities: usize) {
                 .persist_resource::<Research>("research")
                 .insert_resource(Research { tick: 0 })
                 .add_systems(Update, simulate);
+            app.update();
             let owner = app.world_mut().spawn(Player { health: 100 }).id();
             app.world_mut().spawn_batch((0..entities).map(|_| Machine {
                 production: 0,
                 owner,
             }));
             app.update();
-            app.world_mut().save().unwrap();
+            let initial = app.world_mut().save().unwrap();
+            assert_eq!(initial.entities, entities + 1);
+            assert_eq!(initial.upserts, entities + 2);
             (app, directory)
         })
         .bench_local_refs(|(app, _directory)| {

@@ -32,6 +32,7 @@ fn setup(entities: usize, percent: usize) -> Case {
         .persist(component::<Machine>("machine").capture(Capture::Changed))
         .insert_resource(Edits(entities * percent / 100))
         .add_systems(Update, simulate);
+    app.update();
     app.world_mut()
         .spawn_batch((0..entities).map(|index| Machine {
             ticks: 0,

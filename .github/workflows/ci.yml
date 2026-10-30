@@ -70,5 +70,5 @@ jobs:
         key: test
     - name: Run tests and doctests
       run: cargo test --locked
-    - name: Check benchmarks
-      run: cargo check --locked --benches
+    - name: Smoke-test benchmarks
+      run: cargo test --locked --benches

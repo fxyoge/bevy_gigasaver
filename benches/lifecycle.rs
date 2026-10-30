@@ -27,12 +27,17 @@ fn setup(entities: usize) -> (App, tempfile::TempDir) {
                 .autosave(Duration::from_secs(1)),
         )
         .persist(component::<Record>("record").capture(Capture::Changed));
+    app.update();
     app.world_mut()
         .spawn_batch((0..entities).map(|index| Record {
             ticks: 0,
             values: [index as u64; 8],
         }));
     app.update();
+    assert_eq!(
+        app.world_mut().query::<&Record>().iter(app.world()).count(),
+        entities
+    );
     (app, directory)
 }
 
@@ -66,7 +71,7 @@ fn autosave_frame(bencher: Bencher, entities: usize) {
     bencher
         .with_inputs(|| {
             let (mut app, directory) = setup(entities);
-            app.world_mut().save().unwrap();
+            assert_eq!(app.world_mut().save().unwrap().upserts, entities);
             app.add_systems(Update, simulate);
             (app, directory)
         })
@@ -84,7 +89,7 @@ fn load(bencher: Bencher, entities: usize) {
     bencher
         .with_inputs(|| {
             let (mut writer, directory) = setup(entities);
-            writer.world_mut().save().unwrap();
+            assert_eq!(writer.world_mut().save().unwrap().upserts, entities);
             drop(writer);
             let mut reader = App::new();
             reader
@@ -100,7 +105,7 @@ fn load(bencher: Bencher, entities: usize) {
 fn frames() {
     for entities in [1_000, 10_000] {
         let (mut app, _directory) = setup(entities);
-        app.world_mut().save().unwrap();
+        assert_eq!(app.world_mut().save().unwrap().upserts, entities);
         app.add_systems(Update, simulate);
         let mut idle = Vec::new();
         let mut saves = Vec::new();

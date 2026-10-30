@@ -31,15 +31,16 @@ struct Case {
 fn setup(entities: usize, percent: usize) -> Case {
     let directory = tempfile::tempdir().unwrap();
     let mut app = App::new();
-    app.insert_resource(Edits(entities * percent / 100))
+    app.add_plugins(SavePlugin::sqlite(directory.path().join("save.sqlite")))
+        .persist(component::<Machine>("machine"))
+        .insert_resource(Edits(entities * percent / 100))
         .add_systems(Update, simulate);
+    app.update();
     app.world_mut()
         .spawn_batch((0..entities).map(|index| Machine {
             ticks: 0,
             inventory: [index as u64; 8],
         }));
-    app.add_plugins(SavePlugin::sqlite(directory.path().join("save.sqlite")))
-        .persist(component::<Machine>("machine"));
     app.update();
     let initial = app.world_mut().save().unwrap();
     assert_eq!(initial.upserts, entities);
