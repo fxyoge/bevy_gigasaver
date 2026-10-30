@@ -14,5 +14,12 @@
   "automergeType": "pr",
   "automergeStrategy": "rebase",
   "automerge": true,
-  "platformAutomerge": false
+  "platformAutomerge": false,
+  "packageRules": [{
+    "matchPackageNames": ["/bevy_.+$/"],
+    "groupName": "Bevy"
+  }, {
+    "matchPackageNames": ["/^https:\\/\\/github\\.com\\/fxyoge/"],
+    "minimumReleaseAge": "0 days" // disable
+  }]
 }
